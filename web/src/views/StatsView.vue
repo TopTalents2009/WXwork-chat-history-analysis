@@ -14,7 +14,7 @@
         <span class="text-slate-400">~</span>
         <input v-model="endDate" type="date" class="text-sm border border-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500" />
         <button @click="loadStats" class="text-sm bg-primary-600 text-white px-4 py-1.5 rounded-lg hover:bg-primary-700 transition-colors">刷新</button>
-        <router-link :to="{ name: 'chat', params: { platform, sessionId } }" class="text-sm bg-slate-100 text-slate-700 px-4 py-1.5 rounded-lg hover:bg-slate-200 transition-colors">聊天</router-link>
+        <router-link :to="{ name: 'chat', params: { sourceId, sessionId } }" class="text-sm bg-slate-100 text-slate-700 px-4 py-1.5 rounded-lg hover:bg-slate-200 transition-colors">聊天</router-link>
       </div>
     </div>
 
@@ -96,7 +96,7 @@ import Highcharts from 'highcharts'
 import HighchartsVue from 'highcharts-vue'
 
 const route = useRoute()
-const platform = route.params.platform as string
+const sourceId = route.params.sourceId as string
 const sessionId = route.params.sessionId as string
 
 const stats = ref<Stats | null>(null)
@@ -128,7 +128,7 @@ async function loadStats() {
     const params: Record<string, any> = {}
     if (startDate.value) params.start_date = startDate.value
     if (endDate.value) params.end_date = endDate.value
-    const { data } = await chatApi.getStats(platform, sessionId, params)
+    const { data } = await chatApi.getSourceStats(sourceId, sessionId, params)
     stats.value = data
     await nextTick()
     renderCharts()

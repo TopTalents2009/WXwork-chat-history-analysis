@@ -14,6 +14,14 @@
             </span>
           </router-link>
           <div class="flex items-center gap-4">
+            <form class="hidden sm:flex items-center" @submit.prevent="goSearch">
+              <input
+                v-model="navQuery"
+                type="search"
+                placeholder="搜索聊天记录"
+                class="w-56 text-sm border border-slate-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-primary-500/20 focus:border-primary-500"
+              />
+            </form>
             <span class="text-sm text-slate-500">聊天记录分析</span>
           </div>
         </div>
@@ -22,5 +30,89 @@
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
       <router-view />
     </main>
+    <div class="fixed bottom-4 right-4 z-[80] space-y-2 w-80 max-w-[calc(100vw-2rem)]">
+      <div
+        v-for="toast in toasts"
+        :key="toast.id"
+        class="bg-white shadow-xl rounded-2xl border border-slate-200 px-4 py-3"
+      >
+        <div class="text-sm font-semibold text-slate-900">{{ toast.title }}</div>
+        <div class="text-sm text-slate-500 mt-0.5">{{ toast.message }}</div>
+      </div>
+    </div>
   </div>
 </template>
+
+<script setup lang="ts">
+import { onMounted, onUnmounted, provide, ref } from 'vue'
+import { useRouter } from 'vue-router'
+import { chatApi, type PresenceClient, type PresenceAlert } from './api'
+
+const router = useRouter()
+const navQuery = ref('')
+
+const online = ref<PresenceClient[]>([])
+const toasts = ref<PresenceAlert[]>([])
+const lastAlertId = ref(0)
+let primed = false
+let timer: ReturnType<typeof setInterval> | null = null
+
+provide('presenceOnline', online)
+
+onMounted(() => {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission().catch(() => undefined)
+  }
+  pollPresence()
+  timer = setInterval(pollPresence, 4000)
+})
+
+onUnmounted(() => {
+  if (timer) clearInterval(timer)
+})
+
+async function pollPresence() {
+  try {
+    const { data } = await chatApi.getPresence(lastAlertId.value)
+    online.value = data.online || []
+    const alerts = data.alerts || []
+    if (!primed) {
+      primed = true
+      if (alerts.length) lastAlertId.value = Math.max(...alerts.map((item) => item.id))
+      return
+    }
+    if (alerts.length) {
+      lastAlertId.value = Math.max(...alerts.map((item) => item.id))
+      for (const alert of alerts) {
+        pushToast(alert)
+        desktopNotify(alert)
+      }
+    }
+    window.dispatchEvent(new CustomEvent('chatinsight-presence', { detail: { online: online.value, alerts } }))
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+function pushToast(alert: PresenceAlert) {
+  toasts.value = [...toasts.value, alert].slice(-4)
+  window.setTimeout(() => {
+    toasts.value = toasts.value.filter((item) => item.id !== alert.id)
+  }, 8000)
+}
+
+function desktopNotify(alert: PresenceAlert) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return
+  try {
+    new Notification(alert.title, { body: alert.message })
+  } catch {
+    // ignore unsupported environments
+  }
+}
+
+function goSearch() {
+  const q = navQuery.value.trim()
+  if (!q) return
+  router.push({ name: 'search', query: { q } })
+}
+</script>

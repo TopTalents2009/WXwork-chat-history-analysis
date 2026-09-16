@@ -4,17 +4,17 @@ const router = createRouter({
   history: createWebHistory(),
   routes: [
     {
-      path: '/',
-      name: 'home',
-      component: () => import('../views/HomeView.vue'),
+      path: '/search',
+      name: 'search',
+      component: () => import('../views/SearchView.vue'),
     },
     {
-      path: '/chat/:platform/:sessionId',
+      path: '/chat/:sourceId/:sessionId',
       name: 'chat',
       component: () => import('../views/ChatView.vue'),
     },
     {
-      path: '/stats/:platform/:sessionId',
+      path: '/stats/:sourceId/:sessionId',
       name: 'stats',
       component: () => import('../views/StatsView.vue'),
     },

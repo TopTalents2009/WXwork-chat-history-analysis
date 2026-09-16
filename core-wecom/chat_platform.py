@@ -8,11 +8,102 @@ from collections import defaultdict
 
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import importlib.util
+
 from shared.platform_base import BasePlatform, ChatMessage, ChatSession, Contact
+from shared.wecom_ssh import get_live_session, load_live_manifest
+
+_decode_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "message_decode.py")
+_decode_spec = importlib.util.spec_from_file_location("core_wecom_message_decode", _decode_path)
+_decode_mod = importlib.util.module_from_spec(_decode_spec)
+_decode_spec.loader.exec_module(_decode_mod)
+decode_content = _decode_mod.decode_content
+build_display_fields = _decode_mod.build_display_fields
+message_type_name = _decode_mod.message_type_name
+_FILE_EXT_RE = _decode_mod._FILE_EXT_RE
+
+_attach_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "attachments.py")
+_attach_spec = importlib.util.spec_from_file_location("core_wecom_attachments", _attach_path)
+_attach_mod = importlib.util.module_from_spec(_attach_spec)
+_attach_spec.loader.exec_module(_attach_mod)
+WeComAttachmentResolver = _attach_mod.WeComAttachmentResolver
+ATTACHMENT_CONTENT_TYPES = _attach_mod.IMAGE_CONTENT_TYPES | _attach_mod.FILE_CONTENT_TYPES
 
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DECRYPTED_DIR = os.path.join(_PROJECT_ROOT, "export", "wxwork_decrypted")
+
+
+def _append_wxwork_base(path: str, bases: list) -> None:
+    """Add a WXWork root and, if present, a nested WXWork subdirectory."""
+    if not path:
+        return
+    path = os.path.abspath(path)
+    if os.path.isdir(path) and path not in bases:
+        bases.append(path)
+    nested = os.path.join(path, "WXWork")
+    if os.path.isdir(nested) and nested not in bases:
+        bases.append(nested)
+
+
+def _get_wxwork_base_dirs() -> list:
+    """Return possible WXWork root directories (registry custom path + Documents)."""
+    bases = []
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Tencent\WXWork") as key:
+            custom_path, _ = winreg.QueryValueEx(key, "DataLocationPath")
+            _append_wxwork_base(custom_path, bases)
+    except (OSError, ImportError):
+        pass
+
+    documents = os.path.join(os.environ.get("USERPROFILE", ""), "Documents", "WXWork")
+    _append_wxwork_base(documents, bases)
+    return bases
+
+
+def _collect_data_dirs(base_dir: str) -> list:
+    """Find Data directories containing message.db under a WXWork root."""
+    candidates = []
+    seen = set()
+    if not os.path.isdir(base_dir):
+        return candidates
+
+    def add(data_dir: str) -> None:
+        if not os.path.isdir(data_dir):
+            return
+        if not os.path.exists(os.path.join(data_dir, "message.db")):
+            return
+        key = os.path.normcase(os.path.abspath(data_dir))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(data_dir)
+
+    for uid_dir in os.listdir(base_dir):
+        uid_path = os.path.join(base_dir, uid_dir)
+        if not os.path.isdir(uid_path) or not uid_dir.isdigit():
+            continue
+        add(os.path.join(uid_path, "Data"))
+        for version_dir in os.listdir(uid_path):
+            if version_dir == "Data":
+                continue
+            add(os.path.join(uid_path, version_dir, "Data"))
+    return candidates
+
+
+def _latest_wxwork_data_dir() -> Optional[str]:
+    candidates = []
+    seen = set()
+    for base_dir in _get_wxwork_base_dirs():
+        for data_dir in _collect_data_dirs(base_dir):
+            key = os.path.normcase(os.path.abspath(data_dir))
+            if key not in seen:
+                seen.add(key)
+                candidates.append(data_dir)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return candidates[0]
 
 
 def _looks_like_encrypted_dir(data_dir: str) -> bool:
@@ -40,55 +131,121 @@ class WeComPlatform(BasePlatform):
         self._conn = {}
         self._contacts_cache = {}
         self._user_map = {}
+        self._room_nicks = {}
+        self._inferred_self_id = None
+        self._account_roots = None
+        self._attachment_resolver = None
+        self._live = False
         if self.data_dir is None:
             self.data_dir = self.detect_data_dir()
+        live = load_live_manifest()
+        if live and self.data_dir:
+            self._live = os.path.normcase(self.data_dir) == os.path.normcase(
+                live.get("decrypted_dir") or ""
+            )
 
     def detect_data_dir(self) -> Optional[str]:
         """Auto-detect WeCom data directory.
 
-        Prefer already-decrypted directory; fall back to the original encrypted
-        directory so the UI can show that data was detected but not yet decrypted.
+        Prefer a live SSH session (data stays on the remote PC), then a local
+        decrypted directory, then the original encrypted WeCom data directory.
         """
+        live = load_live_manifest()
+        if live and live.get("decrypted_dir"):
+            return live["decrypted_dir"]
+
         if os.path.isdir(self._decrypted_dir):
-            # If decrypted DBs exist and are plaintext, use them.
             msg_db = os.path.join(self._decrypted_dir, "message.db")
             if os.path.exists(msg_db):
                 with open(msg_db, "rb") as f:
                     if f.read(16) == b"SQLite format 3\x00":
                         return self._decrypted_dir
 
-        # Fallback: original encrypted directory
-        user_profile = os.environ.get("USERPROFILE", "")
-        documents = os.path.join(user_profile, "Documents", "WXWork")
-        if not os.path.isdir(documents):
-            return None
+        return _latest_wxwork_data_dir()
 
-        candidates = []
-        for uid_dir in os.listdir(documents):
-            uid_path = os.path.join(documents, uid_dir)
-            if not os.path.isdir(uid_path):
+    def _get_account_roots(self) -> list:
+        if self._account_roots is not None:
+            return self._account_roots
+        roots = []
+        seen = set()
+        for base_dir in _get_wxwork_base_dirs():
+            if not os.path.isdir(base_dir):
                 continue
-            data_dir = os.path.join(uid_path, "Data")
-            if os.path.isdir(data_dir) and os.path.exists(os.path.join(data_dir, "message.db")):
-                candidates.append(data_dir)
-            for version_dir in os.listdir(uid_path):
-                vpath = os.path.join(uid_path, version_dir)
-                if os.path.isdir(vpath):
-                    data_dir = os.path.join(vpath, "Data")
-                    if os.path.isdir(data_dir) and os.path.exists(os.path.join(data_dir, "message.db")):
-                        candidates.append(data_dir)
+            for uid_dir in os.listdir(base_dir):
+                if not uid_dir.isdigit():
+                    continue
+                uid_path = os.path.join(base_dir, uid_dir)
+                cache_dir = os.path.join(uid_path, "Cache")
+                if os.path.isdir(cache_dir) and uid_path not in seen:
+                    seen.add(uid_path)
+                    roots.append(uid_path)
 
-        if candidates:
-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return candidates[0]
-        return None
+        remote_root = os.path.join(_PROJECT_ROOT, "export", "wxwork_remote")
+        if os.path.isdir(remote_root):
+            for uid_dir in os.listdir(remote_root):
+                uid_path = os.path.join(remote_root, uid_dir)
+                cache_dir = os.path.join(uid_path, "Cache")
+                if os.path.isdir(cache_dir) and uid_path not in seen:
+                    seen.add(uid_path)
+                    roots.append(uid_path)
+
+        self._account_roots = roots
+        return self._account_roots
+
+    def _ensure_attachment_resolver(self):
+        if self._attachment_resolver is None:
+            file_db = os.path.join(self._decrypted_dir, "file.db")
+            finder = None
+            if self._live:
+                session = get_live_session()
+                file_db = session.fetch_db("file.db") if session else ""
+
+                def finder(name, md5, _session=session):
+                    if not _session:
+                        return ""
+                    return _session.find_cache_file(name, md5)
+
+            self._attachment_resolver = WeComAttachmentResolver(
+                file_db, self._get_account_roots(), finder=finder
+            )
+        return self._attachment_resolver
+
+    def get_attachment_file(self, message_id: int, filename_hint: str = "") -> str:
+        resolver = self._ensure_attachment_resolver()
+        path = resolver.resolve_file(int(message_id or 0), filename_hint=filename_hint)
+        if path and os.path.isfile(path):
+            return path
+        if path and self._live:
+            session = get_live_session()
+            if session:
+                return session.fetch_attachment(path)
+        return ""
+
+    @staticmethod
+    def _filename_hint(text: str) -> str:
+        if not text:
+            return ""
+        if text.startswith("[") and "]" in text:
+            return text.split("]", 1)[1].strip()
+        if _FILE_EXT_RE.search(text):
+            return text.strip()
+        return ""
 
     def _open_db(self, name: str):
         if name in self._conn:
             return self._conn[name]
-        db_path = os.path.join(self._decrypted_dir, name)
-        if not os.path.exists(db_path):
-            return None
+        if self._live:
+            session = get_live_session()
+            if not session:
+                return None
+            try:
+                db_path = session.fetch_db(name)
+            except Exception:
+                return None
+        else:
+            db_path = os.path.join(self._decrypted_dir, name)
+            if not os.path.exists(db_path):
+                return None
         self._conn[name] = sqlite3.connect(db_path)
         return self._conn[name]
 
@@ -123,6 +280,34 @@ class WeComPlatform(BasePlatform):
                         self._user_map[int(uid)] = display
         except Exception:
             pass
+        self._load_room_nicknames()
+
+    def _load_room_nicknames(self):
+        conn = self._open_db("session.db")
+        if not conn or not self._table_exists(conn, "conversation_member_nickname_table"):
+            return
+        try:
+            for room_id, userid, nickname in conn.execute(
+                "SELECT room_id, userid, nickname FROM conversation_member_nickname_table"
+            ):
+                if nickname and userid is not None and room_id is not None:
+                    self._room_nicks[(int(room_id), int(userid))] = nickname
+        except Exception:
+            pass
+
+    def _resolve_sender(self, sender_id, conversation_id: str = "") -> str:
+        uid = None
+        if isinstance(sender_id, int) or (isinstance(sender_id, str) and str(sender_id).isdigit()):
+            uid = int(sender_id)
+        if uid in (None, 0):
+            return "系统" if uid == 0 else ""
+        if conversation_id.startswith("R:"):
+            tail = conversation_id[2:]
+            if tail.isdigit():
+                nick = self._room_nicks.get((int(tail), uid))
+                if nick:
+                    return nick
+        return self._user_map.get(uid, str(uid))
 
     def _name_from_conversation_id(self, conversation_id: str) -> str:
         if not conversation_id:
@@ -167,11 +352,35 @@ class WeComPlatform(BasePlatform):
     @property
     def _self_id(self) -> Optional[int]:
         if not self.data_dir:
-            return None
+            return self._inferred_self_id
         parts = os.path.normpath(self.data_dir).split(os.sep)
         for part in reversed(parts):
             if part.isdigit() and len(part) >= 10:
                 return int(part)
+        if self._inferred_self_id:
+            return self._inferred_self_id
+        counts = {}
+        session_n = 0
+        session_db = self._open_db("session.db")
+        cids = []
+        if session_db and self._table_exists(session_db, "conversation_table"):
+            cids = [
+                row[0]
+                for row in session_db.execute("SELECT id FROM conversation_table")
+            ]
+        for cid in cids:
+            if not str(cid).startswith("S:"):
+                continue
+            ids = [int(x) for x in str(cid)[2:].split("_") if x.isdigit()]
+            if len(ids) < 2:
+                continue
+            session_n += 1
+            for uid in ids:
+                counts[uid] = counts.get(uid, 0) + 1
+        for uid, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+            if session_n >= 2 and n == session_n:
+                self._inferred_self_id = uid
+                return uid
         return None
 
     def list_sessions(self, limit: int = 100) -> List[ChatSession]:
@@ -179,7 +388,7 @@ class WeComPlatform(BasePlatform):
         result = []
 
         # If the detected directory is still encrypted, show a helpful placeholder.
-        if _looks_like_encrypted_dir(self.data_dir):
+        if not self._live and _looks_like_encrypted_dir(self.data_dir):
             result.append(ChatSession(
                 username="__need_decrypt__",
                 display_name="企业微信数据尚未解密",
@@ -270,17 +479,34 @@ class WeComPlatform(BasePlatform):
                     m = dict(zip(cols, row))
                     ts = m.get("send_time")
                     dt = datetime.fromtimestamp(ts) if ts else None
-                    sender_id = m.get("sender", "")
-                    sender = self._user_map.get(int(sender_id), str(sender_id)) if isinstance(sender_id, int) or (isinstance(sender_id, str) and sender_id.isdigit()) else str(sender_id)
+                    sender_raw = m.get("sender_id")
+                    if sender_raw in (None, ""):
+                        sender_raw = m.get("sender")
+                    sender = self._resolve_sender(sender_raw, session_id)
+                    sender_id = sender_raw if sender_raw not in (None, "") else ""
+                    content_type = int(m.get("content_type") or 0)
+                    message_id = int(m.get("message_id") or m.get("id") or 0)
+                    text, media_url, attachment_name = build_display_fields(
+                        content_type,
+                        m.get("content"),
+                        m.get("extra_content") or "",
+                        m.get("local_extra_content") or "",
+                    )
+                    filename_hint = attachment_name or self._filename_hint(text)
                     result.append(ChatMessage(
                         time=dt,
                         time_text=dt.strftime("%H:%M") if dt else "",
                         hour=dt.hour if dt else None,
                         sender=sender,
                         sender_id=str(sender_id),
-                        text=str(m.get("content", "")),
-                        msg_type=m.get("msg_type", 0),
+                        text=text,
+                        msg_type=content_type or m.get("msg_type", 0),
+                        msg_type_label=message_type_name(content_type),
                         chatroom=session_id,
+                        message_id=message_id,
+                        has_attachment=content_type in ATTACHMENT_CONTENT_TYPES or bool(media_url or filename_hint),
+                        attachment_name=filename_hint,
+                        media_url=media_url,
                         raw=m,
                     ))
         except Exception:

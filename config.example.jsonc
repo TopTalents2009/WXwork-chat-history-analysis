@@ -64,5 +64,25 @@
       // 每个话题最多摘录聊天原文条数。默认 3。
       "evidence_per_topic": 3,
     }
+  },
+  // 从另一台 Windows 电脑 SSH 拉取企业微信数据。
+  // 本机: python scripts/pull_wecom_remote.py
+  // 远端需开启 OpenSSH，并保持企业微信已登录。
+  "wecom_remote": {
+    // 远端 IP 或主机名。
+    "host": "192.168.2.14",
+    // 远端 Windows 用户名。
+    "user": "mache",
+    "port": 22,
+    // SSH 私钥。先运行 setup_ssh_key.bat 生成并安装。
+    "key_file": "",
+    // 不建议写密码。可用环境变量 WECOM_REMOTE_PASSWORD，或配置 SSH 密钥。
+    "password": "",
+    // 默认 live：远端解密后数据留在远端，本机按需 SSH 读取，不整包下载。
+    "live": true,
+    // 仅 --download 时生效。是否同时拉取聊天图片/文件。
+    "include_cache": false,
+    // 远端同步助手推送数据时使用的令牌。留空则自动生成到 export/ingest_token.txt
+    "ingest_token": ""
   }
 }

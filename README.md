@@ -1,123 +1,164 @@
-# ChatInsight — IM 聊天记录解密分析
+# 企业微信聊天记录分析
 
-解密本地 IM 聊天记录，查询消息，生成日报统计。
+本机或局域网电脑上的企业微信聊天记录解密、同步、检索与查看。分析机跑 Web 界面，远端电脑只装同步助手；默认同步文字记录，图片走 CDN，文件按需拉取。
 
-## 支持平台
+也保留个人微信、钉钉的解密与日报能力，见文末「其它平台」。
 
-| 平台 | 状态 | 加密方式 | 密钥来源 | 详细文档 |
-|------|------|---------|---------|---------|
-| **微信** | ✅ 完全可用 | SQLCipher 4 | wx_key.exe 内存提取 | [core-wechat/](core-wechat/) |
-| **企业微信** | ⚠️ 可用 | wxSQLite3 AES-128-CBC | wechat-decrypt 内存扫描 | [core-wecom/](core-wecom/) |
-| **钉钉** | ✅ 完全可用 | AES-128-ECB | UID+salt→PBKDF2→MD5 | [core-dingtalk/](core-dingtalk/) |
-| **飞书** | ❌ 暂不可行 | SQLCipher | 需要 app_secret | [core-feishu/](core-feishu/) |
+## 能做什么
 
-### 加密方案发现过程
+- **网页查看**：按电脑 → 会话 → 消息浏览，支持日期筛选和统计
+- **全文搜索**：服务端检索已同步消息的正文、发送者、文件名
+- **远端同步**：把 `WeComSyncAgent.exe` 拷到对方电脑，勾选会话后推到分析机
+- **按需下文件**：同步默认不拉附件；点击下载后由在线助手回传本地缓存
+- **助手自动更新**：分析机打包新版本后，已安装更新逻辑的助手会自行替换 exe
+- **本机解密**：分析机自己装着企业微信时，可直接扫进程密钥并解密
 
-所有平台的加密方案均通过**逆向分析**确认：
-- 微信：分析 `Weixin.exe` 进程内存中的 `sqlite3_key` 调用
-- 企微：扫描 `WXWork.exe` 进程内存中的 wxSQLite3 密钥
-- 钉钉：逆向 `liblark.dll` 中的 AES-ECB 加密逻辑 + 看雪论坛逆向分析
-- 飞书：逆向 `liblark.dll` 发现需要服务器端 `app_secret`
-
-## 效果展示
-
-<p align="center">
-  <img src="_docs/images/image1.png" width="48%" alt="日报示例1">
-  <img src="_docs/images/image2.png" width="48%" alt="日报示例2">
-</p>
-
-## 项目结构
+## 架构
 
 ```
-├── wechat.py              # CLI 入口
-├── config.jsonc            # 本地配置
-├── core-wechat/           # 微信解密（完全独立）
-├── core-wecom/            # 企业微信解密（完全独立）
-├── core-dingtalk/         # 钉钉解密（完全独立）
-├── core-feishu/           # 飞书（预留）
-├── shared/                # 平台抽象基类
-├── api/                   # 后端 API（FastAPI）
-├── web/                   # 前端（Vue + Tailwind + Highcharts）
-├── scripts/               # 辅助脚本
-├── tests/                 # 测试
-├── tools/                 # 外部工具（git submodule）
-├── export_parse_result/   # 输出目录（gitignore）
-└── _docs/                 # 文档
+远端 Windows（企业微信已登录）
+  WeComSyncAgent.exe
+    → 内存提取密钥、解密 message/session/user 等库
+    → 勾选会话 JSON 推送到分析机
+    → 心跳保活；按需回传 Cache 里的文件
+    → 发现新版本则下载校验并替换自身
+
+分析机
+  FastAPI :8767     入库、搜索、附件任务、助手更新包
+  Vue :5173         来源列表 / 聊天 / 统计 / 搜索
+  export/synced/    远端同步数据（不入库 git）
 ```
 
-每个平台目录完全独立，互不依赖。
+## 环境
 
-## 快速开始
-
-### 微信
+- Windows 10+
+- Python 3.10+
+- Node.js 18+（前端）
+- 企业微信保持登录（解密需要扫 `WXWork.exe` 内存）
 
 ```bash
-# 1. 提取密钥（微信保持运行）
-tools\wx_key\wx_key.exe  # 复制 64 位 hex
-
-# 2. 初始化
-python wechat.py setup --raw-key <raw_key>
-
-# 3. 解密
-python wechat.py decrypt
-
-# 4. 生成日报
-python wechat.py report
-```
-
-### 钉钉
-
-```bash
-# 1. 自动提取 UID
-python core-dingtalk/find_uid.py
-
-# 2. 解密
-python core-dingtalk/decrypt.py
-
-# 3. 导出数据
-python core-dingtalk/export_all.py
-```
-
-### Web 界面
-
-```bash
-# 启动后端
-python -m uvicorn api.server:app --port 8765
-
-# 启动前端
-cd web && pnpm dev
-```
-
-## 安装
-
-```bash
+git clone https://github.com/accten/WXwork-chat-history-analysis.git
+cd WXwork-chat-history-analysis
 git submodule update --init --recursive
 pip install -r requirements.txt
-cp config.example.jsonc config.jsonc
+cd web && npm install && cd ..
+copy config.example.jsonc config.jsonc
 ```
 
-## LLM 配置
+`config.jsonc` 不要提交。里面的 `llm.auth_token`、远端密码、同步令牌只放本机。
 
-编辑 `config.jsonc`：
+## 快速开始（分析机）
 
-```json
-{
-  "llm": {
-    "auth_token": "your_api_key",
-    "base_url": "https://api.deepseek.com/anthropic",
-    "model": "anthropic/deepseek-v4-flash"
-  }
-}
+双击 `start.bat`，或：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
-## 依赖
+浏览器打开 [http://localhost:5173](http://localhost:5173)。后端 API 在 [http://localhost:8767](http://localhost:8767)。
 
-- Python 3.10+
-- pycryptodome, sqlcipher3, litellm, fastapi, uvicorn
-- Node.js (前端: pnpm + Vue 3 + Tailwind + Highcharts)
+首页会显示局域网地址和同步令牌。把助手装到其它电脑时用这个地址，不要填 `127.0.0.1`（会连到对方自己）。
+
+## 远端同步助手
+
+1. 分析机打包：
+
+```bat
+build_agent.bat
+```
+
+产物是 `dist\WeComSyncAgent.exe`（gitignore，需自行分发）。
+
+2. 拷到远端电脑运行，填写真实姓名（用于在线提醒）。助手会向分析机拉令牌。
+3. 保持企业微信已登录，点「解密并刷新会话」，勾选要同步的群/单聊。
+4. 点「完成」转入后台；开机可自启。未勾选的会话不会自动同步。
+
+默认同步间隔 5 分钟，只同步勾选项。点「退出应用」会取消开机项并结束进程。
+
+### 按需拉文件
+
+同步不下载附件。网页里点「下载」后：
+
+1. 分析机给这台电脑建一个任务
+2. 助手约 5 秒心跳拿到任务，在本机企业微信 `Cache` 里找文件
+3. 上传到 `export/synced/<电脑>/files/`，网页再下载
+
+文件从未在企业微信里打开过，缓存里就没有，会提示「对方电脑未缓存该文件」。图片一般走企微 CDN，不必回传。
+
+### 自动更新
+
+改 `agent/VERSION` → 再跑 `build_agent.bat`。助手心跳会对比版本和 SHA256，校验通过后替换 exe 并重启。配置在 `%APPDATA%\WeComSyncAgent`，不会被覆盖。
+
+**没有更新逻辑的旧助手仍需手动拷一次新 exe。**
+
+## 本机解密
+
+分析机自己登录了企业微信时：
+
+```bat
+decrypt_wecom.bat
+```
+
+或在助手里点「解密并刷新会话」。解密输出在 `export/wxwork_decrypted/`（gitignore）。
+
+密钥来自 `WXWork.exe` 内存中的 wxSQLite3 AES-128 缓存 key。进程内存越大、库文件越多，越慢；机械盘和杀毒实时扫描也会拉长时间。
+
+## 搜索
+
+顶栏搜索框检索全部已同步来源；聊天页「搜索本会话」只搜当前会话。多个词用空格分开，需同时命中。
+
+```
+GET /api/search?q=申报&source_id=&session_id=&limit=50
+```
+
+## 主要接口
+
+| 路径 | 说明 |
+|------|------|
+| `GET /api/sources` | 本机 + 已同步电脑 |
+| `GET /api/sources/{id}/sessions` | 会话列表 |
+| `GET /api/sources/{id}/messages/{sid}` | 消息 |
+| `GET /api/search` | 关键词搜索 |
+| `GET /api/sources/{id}/attachments/{mid}` | 本机缓存或按需回传 |
+| `GET /api/ingest/info` | 令牌、局域网 URL、助手更新信息 |
+| `POST /api/ingest/wecom` | 助手推送会话 |
+| `POST /api/ingest/heartbeat` | 在线心跳；返回文件任务和更新信息 |
+
+## 目录
+
+```
+├── start.bat / start.ps1     一键起 API + 前端
+├── build_agent.bat           打包同步助手
+├── agent/                    远端 WeComSyncAgent
+├── api/server.py             FastAPI
+├── web/                      Vue 3 + Tailwind + Vite
+├── core-wecom/               企微查询、消息解码、附件定位
+├── shared/                   同步库、搜索、在线状态、按需文件、助手更新
+├── tools/wechat-decrypt/     密钥扫描与库解密（submodule）
+├── config.example.jsonc      配置模板
+├── tests/                    unittest
+└── export/                   运行时数据（gitignore）
+```
+
+## 测试
+
+```bash
+python -m unittest discover tests
+```
+
+## 安全与使用边界
+
+- 只用于你有权访问的电脑和账号（本机或已授权的办公电脑）。
+- 不要把 `config.jsonc`、`export/`、`all_keys.json`、解密库、同步令牌提交到 git。
+- 同步令牌相当于写入凭证，不要发到公开群。
+- 助手更新包由分析机提供，请保证 `dist\WeComSyncAgent.exe` 来自本仓库的打包脚本。
+
+## 其它平台
+
+个人微信、钉钉仍可用原 CLI 解密和日报（`python wechat.py`、`core-dingtalk/`）。飞书目前不可用。详情见各 `core-*/README.md`。
 
 ## 致谢
 
-- [WeChatDecrypt](https://github.com/ylytdeng/wechat-decrypt) — 微信数据库解密
+- [WeChatDecrypt](https://github.com/ylytdeng/wechat-decrypt) — 微信 / 企业微信库解密
 - [wx_key](https://github.com/ycccccccy/wx_key) — 微信密钥提取
-- [dingwave-V3](https://github.com/E2ern1ty/dingwave-V3) — 钉钉数据库解密
+- [dingwave-V3](https://github.com/E2ern1ty/dingwave-V3) — 钉钉库解密

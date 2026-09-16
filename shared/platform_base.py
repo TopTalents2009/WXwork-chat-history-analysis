@@ -16,6 +16,11 @@ class ChatMessage:
     msg_type: int = 0
     msg_type_label: str = ""
     chatroom: str = ""
+    message_id: int = 0
+    has_attachment: bool = False
+    attachment_name: str = ""
+    attachment_kind: str = ""
+    media_url: str = ""
     raw: Any = None
 
 

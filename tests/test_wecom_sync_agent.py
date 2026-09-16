@@ -1,0 +1,240 @@
+import hashlib
+import importlib.util
+import json
+import os
+import tempfile
+import unittest
+from unittest import mock
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+spec = importlib.util.spec_from_file_location(
+    "wecom_sync_agent", os.path.join(ROOT, "agent", "wecom_sync_agent.py")
+)
+agent = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(agent)
+
+
+class WecomSyncAgentTests(unittest.TestCase):
+    def test_splits_group_and_direct_chats(self):
+        rows = [
+            {"id": "R:1", "session_type": 2, "display_name": "家"},
+            {"id": "1688", "session_type": 1, "display_name": "张三"},
+            {"id": "wxid_a@chatroom", "session_type": 0, "display_name": "旧群"},
+        ]
+        groups, singles = agent.split_conversations(rows)
+        self.assertEqual([g["display_name"] for g in groups], ["家", "旧群"])
+        self.assertEqual([s["display_name"] for s in singles], ["张三"])
+
+    def test_default_server_replaces_localhost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "settings.json")
+            with open(settings, "w", encoding="utf-8") as f:
+                json.dump({"server_url": "http://127.0.0.1:8767", "token": "old"}, f)
+            with mock.patch.object(agent, "SETTINGS_FILE", settings):
+                data = agent._load_settings()
+            self.assertEqual(data["server_url"], agent.DEFAULT_SERVER_URL)
+
+    def test_fetch_ingest_info_reads_token(self):
+        payload = json.dumps({"token": "abc123", "urls": ["http://192.168.2.25:8767"]}).encode()
+
+        class FakeResp:
+            def read(self):
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with mock.patch.object(agent.request, "urlopen", return_value=FakeResp()):
+            info = agent.fetch_ingest_info("http://192.168.2.25:8767")
+        self.assertEqual(info["token"], "abc123")
+
+    def test_auto_sync_skips_when_none_checked(self):
+        rows = [
+            {"id": "R:1", "display_name": "家"},
+            {"id": "2", "display_name": "张三"},
+        ]
+        selected = agent.sessions_for_auto_sync(rows, [])
+        self.assertEqual(selected, [])
+
+    def test_auto_sync_filters_checked_ids(self):
+        rows = [
+            {"id": "R:1", "display_name": "家"},
+            {"id": "2", "display_name": "张三"},
+        ]
+        selected = agent.sessions_for_auto_sync(rows, ["2"])
+        self.assertEqual([s["id"] for s in selected], ["2"])
+
+    def test_auto_sync_interval_is_five_minutes(self):
+        self.assertEqual(agent.AUTO_SYNC_INTERVAL_MS, 5 * 60 * 1000)
+
+    def test_hidden_run_uses_no_window_flag(self):
+        if os.name != "nt":
+            self.skipTest("Windows only")
+        self.assertTrue(agent._no_window_flags() & __import__("subprocess").CREATE_NO_WINDOW)
+        captured = {}
+
+        def fake_run(*args, **kwargs):
+            captured.update(kwargs)
+            class Result:
+                stdout = ""
+            return Result()
+
+        with mock.patch.object(agent.subprocess, "run", side_effect=fake_run):
+            agent._wxwork_running()
+        self.assertTrue(captured.get("creationflags", 0) & __import__("subprocess").CREATE_NO_WINDOW)
+
+    def test_autostart_command_uses_background_flag(self):
+        cmd = agent.autostart_command()
+        self.assertIn("--background", cmd)
+        self.assertTrue(cmd.startswith('"'))
+
+    def test_disable_autostart_deletes_run_value(self):
+        deleted = []
+
+        class FakeKey:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        fake = mock.MagicMock()
+        fake.OpenKey.return_value = FakeKey()
+        fake.DeleteValue.side_effect = lambda _key, name: deleted.append(name)
+        fake.HKEY_CURRENT_USER = 1
+        fake.KEY_SET_VALUE = 2
+        with mock.patch.dict("sys.modules", {"winreg": fake}):
+            agent.disable_autostart()
+        self.assertEqual(deleted, [agent.AUTOSTART_NAME])
+
+    def test_name_from_direct_chat_id(self):
+        users = {1688854697859602: "陈旭", 1688855370846072: "吴贤腾"}
+        name = agent._name_from_conversation_id(
+            "S:1688854697859602_1688855370846072", users, 1688855370846072
+        )
+        self.assertEqual(name, "陈旭")
+
+    def test_resolve_sender_uses_user_map(self):
+        users = {1688855087850576: "张浪"}
+        self.assertEqual(
+            agent._resolve_sender(1688855087850576, "R:1", users, {}),
+            "张浪",
+        )
+        ident = agent.client_identity("张三")
+        self.assertEqual(ident["operator_name"], "张三")
+        self.assertEqual(ident["username"], "张三")
+        self.assertTrue(ident["computer_name"])
+
+    def test_windows_username_is_not_real_name(self):
+        with mock.patch.dict(os.environ, {"USERNAME": "Administrator"}):
+            self.assertFalse(agent.looks_like_real_name(""))
+            self.assertFalse(agent.looks_like_real_name("A"))
+            self.assertFalse(agent.looks_like_real_name("Administrator"))
+            self.assertTrue(agent.looks_like_real_name("张三"))
+
+    def test_load_settings_clears_windows_username(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = os.path.join(tmp, "settings.json")
+            with open(settings, "w", encoding="utf-8") as f:
+                json.dump({"operator_name": "Administrator"}, f)
+            with mock.patch.object(agent, "SETTINGS_FILE", settings):
+                with mock.patch.dict(os.environ, {"USERNAME": "Administrator"}):
+                    data = agent._load_settings()
+            self.assertEqual(data["operator_name"], "")
+
+    def test_heartbeat_interval_is_five_seconds(self):
+        self.assertEqual(agent.HEARTBEAT_INTERVAL_MS, 5 * 1000)
+
+    def test_process_file_job_reports_missing(self):
+        with mock.patch.object(agent, "find_local_attachment", return_value=""):
+            with mock.patch.object(agent, "report_file_job", return_value={"ok": True}) as report:
+                status = agent.process_file_job("http://x", "tok", {
+                    "job_id": "abc",
+                    "message_id": 1,
+                    "filename": "a.zip",
+                })
+        self.assertEqual(status, "missing")
+        report.assert_called_once_with(
+            "http://x", "tok", "abc", "missing", "对方电脑未缓存该文件"
+        )
+
+    def test_process_file_job_uploads_when_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "a.zip")
+            with open(path, "wb") as f:
+                f.write(b"hello")
+            with mock.patch.object(agent, "find_local_attachment", return_value=path):
+                with mock.patch.object(agent, "upload_attachment", return_value={"ok": True}) as up:
+                    status = agent.process_file_job("http://x", "tok", {
+                        "job_id": "abc",
+                        "message_id": 12,
+                        "filename": "a.zip",
+                    })
+        self.assertEqual(status, "ready")
+        up.assert_called_once()
+
+    def test_version_newer(self):
+        self.assertTrue(agent.version_newer("2026.09.16.2", "2026.09.16.1"))
+        self.assertFalse(agent.version_newer("2026.09.16.1", "2026.09.16.1"))
+        self.assertFalse(agent.version_newer("2026.09.16.1", "2026.09.16.2"))
+
+    def test_should_apply_update_skips_same_hash(self):
+        info = {"version": "9.9.9", "sha256": "abc", "size": 12}
+        self.assertFalse(agent.should_apply_update("1.0", info, "ABC"))
+        self.assertTrue(agent.should_apply_update("1.0", info, "ddd"))
+        self.assertTrue(agent.should_apply_update("9.9.9", info, "ddd"))
+        self.assertFalse(agent.should_apply_update("9.9.9", {"version": "1.0", "sha256": "ddd", "size": 12}, "abc"))
+        self.assertFalse(agent.should_apply_update("9.9.9", {"version": "9.9.9", "sha256": "", "size": 1}))
+
+    def test_resolve_update_url(self):
+        self.assertEqual(
+            agent.resolve_update_url("http://192.168.2.25:8767", "/api/ingest/agent-exe"),
+            "http://192.168.2.25:8767/api/ingest/agent-exe",
+        )
+        self.assertEqual(
+            agent.resolve_update_url("http://x", "http://cdn/a.exe"),
+            "http://cdn/a.exe",
+        )
+
+    def test_download_agent_exe_checks_hash(self):
+        payload = b"new-exe"
+        sha = hashlib.sha256(payload).hexdigest()
+
+        class FakeResp:
+            def read(self, _n=None):
+                if getattr(self, "done", False):
+                    return b""
+                self.done = True
+                return payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "WeComSyncAgent.exe")
+            with mock.patch.object(agent.request, "urlopen", return_value=FakeResp()):
+                path = agent.download_agent_exe("http://x/a", "tok", dest, len(payload), sha)
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+    def test_write_updater_script(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(agent, "WORK_DIR", tmp):
+                script = agent.write_updater_script(123, os.path.join(tmp, "new.exe"), r"C:\app\WeComSyncAgent.exe", ["--background"])
+            self.assertTrue(os.path.isfile(script))
+            plan = os.path.join(tmp, "update", "plan.json")
+            with open(plan, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["pid"], 123)
+            self.assertEqual(data["args"], ["--background"])
+
+
+if __name__ == "__main__":
+    unittest.main()
