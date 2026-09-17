@@ -11,7 +11,8 @@ import urllib.request
 from typing import Optional, List
 from collections import Counter
 
-from fastapi import FastAPI, Query, HTTPException, Header, Request
+from fastapi import Depends, FastAPI, Query, HTTPException, Header, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,7 +29,7 @@ import importlib
 _wechat_mod = importlib.import_module('core-wechat.chat_platform')
 _wecom_mod = importlib.import_module('core-wecom.chat_platform')
 _dingtalk_mod = importlib.import_module('core-dingtalk.chat_platform')
-from shared import agent_update, file_jobs, message_search, synced_store
+from shared import agent_update, api_keys, file_jobs, lan, message_search, synced_store
 from shared.presence import PresenceHub
 from shared.wecom_ssh import load_live_manifest, strip_jsonc
 import json
@@ -157,6 +158,8 @@ class AgentUpdateInfo(BaseModel):
     sha256: str
     size: int
     url: str = "/api/ingest/agent-exe"
+    notes: str = ""
+    changelog: list = []
 
 
 class SearchHit(BaseModel):
@@ -175,10 +178,26 @@ class SearchHit(BaseModel):
     media_url: str = ""
 
 
+class ReadApiKeyInfo(BaseModel):
+    name: str = "default"
+    key: str = ""
+
+
+class ReadApiInfo(BaseModel):
+    enabled: bool = True
+    key: str = ""
+    keys: List[ReadApiKeyInfo] = []
+    urls: List[str] = []
+    example: str = ""
+
+
 class IngestInfo(BaseModel):
     token: str
     port: int = 8767
     urls: List[str] = []
+    web_port: int = 5173
+    web_urls: List[str] = []
+    read_api: Optional[ReadApiInfo] = None
     agent_update: Optional[AgentUpdateInfo] = None
 
 
@@ -207,19 +226,7 @@ def _load_ingest_token() -> str:
 
 
 def _lan_urls(port: int = 8767) -> List[str]:
-    urls = [f"http://127.0.0.1:{port}"]
-    try:
-        hostname = socket.gethostname()
-        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
-            ip = info[4][0]
-            if ip.startswith("127."):
-                continue
-            url = f"http://{ip}:{port}"
-            if url not in urls:
-                urls.append(url)
-    except OSError:
-        pass
-    return urls
+    return lan.lan_urls(port)
 
 
 def _check_ingest_token(payload_token: str = "", header_token: str = ""):
@@ -227,6 +234,48 @@ def _check_ingest_token(payload_token: str = "", header_token: str = ""):
     got = (header_token or payload_token or "").strip()
     if not expected or got != expected:
         raise HTTPException(status_code=401, detail="Invalid ingest token")
+
+
+def require_read_api_key(
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(None),
+    key: str = Query("", alias="key"),
+) -> dict:
+    if not api_keys.is_enabled():
+        raise HTTPException(status_code=403, detail="Open API is disabled")
+    token = api_keys.extract_token(x_api_key or "", authorization or "", key)
+    found = api_keys.verify(token)
+    if not found:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return found
+
+
+def _v1_ok(data, **meta):
+    payload = {"ok": True, "data": jsonable_encoder(data)}
+    payload.update(meta)
+    return payload
+
+
+def _message_day(item) -> str:
+    if isinstance(item, dict):
+        text = item.get("time_text") or ""
+    else:
+        text = getattr(item, "time_text", "") or ""
+    return str(text)[:10]
+
+
+def _filter_v1_messages(rows, start_date: Optional[str], end_date: Optional[str],
+                        offset: int, limit: int):
+    filtered = []
+    for item in rows:
+        day = _message_day(item)
+        if start_date and day and day < start_date:
+            continue
+        if end_date and day and day > end_date:
+            continue
+        filtered.append(item)
+    sliced = filtered[offset:offset + limit]
+    return sliced, len(filtered)
 
 
 def _show_windows_balloon(title: str, message: str) -> None:
@@ -356,10 +405,15 @@ def _agent_update_payload() -> Optional[dict]:
 @app.get("/api/ingest/info")
 async def ingest_info():
     update = _agent_update_payload()
+    api_urls = _lan_urls(8767)
+    read_api = ReadApiInfo(**api_keys.homepage_info(api_urls))
     return IngestInfo(
         token=_load_ingest_token(),
         port=8767,
-        urls=_lan_urls(8767),
+        urls=api_urls,
+        web_port=5173,
+        web_urls=_lan_urls(5173),
+        read_api=read_api,
         agent_update=AgentUpdateInfo(**update) if update else None,
     )
 
@@ -583,6 +637,78 @@ async def get_source_messages(
         raise HTTPException(status_code=404, detail="Unknown computer")
     rows = synced_store.list_messages(source_id, session_id, limit=limit)
     return [_message_response(m) for m in rows]
+
+
+@app.get("/v1/health")
+async def v1_health():
+    return {"ok": True, "service": "chatinsight", "read_api": api_keys.is_enabled()}
+
+
+@app.get("/v1/info")
+async def v1_info(auth: dict = Depends(require_read_api_key)):
+    return _v1_ok({
+        "key_name": auth.get("name") or "key",
+        "endpoints": [
+            "GET /v1/health",
+            "GET /v1/info",
+            "GET /v1/sources",
+            "GET /v1/sources/{source_id}/sessions",
+            "GET /v1/sources/{source_id}/messages/{session_id}",
+            "GET /v1/search?q=",
+        ],
+    })
+
+
+@app.get("/v1/sources")
+async def v1_sources(_auth: dict = Depends(require_read_api_key)):
+    items = await list_sources()
+    return _v1_ok(items, count=len(items))
+
+
+@app.get("/v1/sources/{source_id}/sessions")
+async def v1_source_sessions(
+    source_id: str,
+    limit: int = Query(200, ge=1, le=1000),
+    _auth: dict = Depends(require_read_api_key),
+):
+    items = await list_source_sessions(source_id, limit)
+    return _v1_ok(items, count=len(items), source_id=source_id)
+
+
+@app.get("/v1/sources/{source_id}/messages/{session_id}")
+async def v1_source_messages(
+    source_id: str,
+    session_id: str,
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    offset: int = Query(0, ge=0, le=100000),
+    limit: int = Query(200, ge=1, le=1000),
+    _auth: dict = Depends(require_read_api_key),
+):
+    fetch_limit = 5000 if (start_date or end_date or offset) else limit
+    rows = await get_source_messages(source_id, session_id, start_date, end_date, fetch_limit)
+    data, total = _filter_v1_messages(rows, start_date, end_date, offset, limit)
+    return _v1_ok(
+        data,
+        count=len(data),
+        total=total,
+        offset=offset,
+        limit=limit,
+        source_id=source_id,
+        session_id=session_id,
+    )
+
+
+@app.get("/v1/search")
+async def v1_search(
+    q: str = Query(..., min_length=1, max_length=80),
+    source_id: str = Query(""),
+    session_id: str = Query(""),
+    limit: int = Query(50, ge=1, le=200),
+    _auth: dict = Depends(require_read_api_key),
+):
+    items = await search_messages(q, source_id, session_id, limit)
+    return _v1_ok(items, count=len(items), q=q)
 
 
 @app.get("/api/sources/{source_id}/stats/{session_id}")

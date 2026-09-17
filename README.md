@@ -55,9 +55,15 @@ copy config.example.jsonc config.jsonc
 powershell -ExecutionPolicy Bypass -File .\start.ps1
 ```
 
-浏览器打开 [http://localhost:5173](http://localhost:5173)。后端 API 在 [http://localhost:8767](http://localhost:8767)。
+浏览器打开 [http://localhost:5173](http://localhost:5173)。同一局域网的手机或其它电脑打开启动窗口里打印的 `http://<局域网IP>:5173`。后端 API 在 8767 端口。
 
-首页会显示局域网地址和同步令牌。把助手装到其它电脑时用这个地址，不要填 `127.0.0.1`（会连到对方自己）。
+首页会显示可点击复制的局域网地址和同步令牌。把助手装到其它电脑时用 8767 地址，不要填 `127.0.0.1`（会连到对方自己）。
+
+若其它设备打不开，用管理员运行一次：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\open_lan_firewall.ps1
+```
 
 ## 远端同步助手
 
@@ -87,7 +93,7 @@ build_agent.bat
 
 ### 自动更新
 
-改 `agent/VERSION` → 再跑 `build_agent.bat`。助手心跳会对比版本和 SHA256，校验通过后替换 exe 并重启。配置在 `%APPDATA%\WeComSyncAgent`，不会被覆盖。
+改 `agent/VERSION` 和 `agent/CHANGELOG.md` → 再跑 `build_agent.bat`。助手心跳会对比版本和 SHA256，校验通过后替换 exe 并重启。再次打开助手会弹出本次更新说明。配置在 `%APPDATA%\WeComSyncAgent`，不会被覆盖。
 
 **没有更新逻辑的旧助手仍需手动拷一次新 exe。**
 
@@ -111,6 +117,17 @@ decrypt_wecom.bat
 GET /api/search?q=申报&source_id=&session_id=&limit=50
 ```
 
+## 开放读取 API
+
+完整说明见 [_docs/OPEN_API.md](_docs/OPEN_API.md)。其它程序用 API Key 只读聊天记录，接口在 **8767** 端口的 `/v1`。网页浏览仍走 5173，不需要这个 key。
+
+首页可复制地址和 key。也可写在 `config.jsonc` 的 `open_api`。`read_key` 留空时自动生成到 `export/api_read_key.txt`。
+
+```bash
+curl http://192.168.2.25:8767/v1/health
+curl -H "X-API-Key: YOUR_KEY" http://192.168.2.25:8767/v1/sources
+```
+
 ## 主要接口
 
 | 路径 | 说明 |
@@ -122,7 +139,12 @@ GET /api/search?q=申报&source_id=&session_id=&limit=50
 | `GET /api/sources/{id}/attachments/{mid}` | 本机缓存或按需回传 |
 | `GET /api/ingest/info` | 令牌、局域网 URL、助手更新信息 |
 | `POST /api/ingest/wecom` | 助手推送会话 |
-| `POST /api/ingest/heartbeat` | 在线心跳；返回文件任务和更新信息 |
+| `GET /api/ingest/heartbeat` | 在线心跳；返回文件任务和更新信息 |
+| `GET /v1/health` | 探活，无需 key |
+| `GET /v1/sources` | 电脑列表（需 API Key） |
+| `GET /v1/sources/{id}/sessions` | 会话列表 |
+| `GET /v1/sources/{id}/messages/{sid}` | 消息 |
+| `GET /v1/search` | 关键词搜索 |
 
 ## 目录
 
@@ -151,6 +173,7 @@ python -m unittest discover tests
 - 只用于你有权访问的电脑和账号（本机或已授权的办公电脑）。
 - 不要把 `config.jsonc`、`export/`、`all_keys.json`、解密库、同步令牌提交到 git。
 - 同步令牌相当于写入凭证，不要发到公开群。
+- 开放读取 API 的 key 能看到已同步的聊天正文，按人分发、用完作废。
 - 助手更新包由分析机提供，请保证 `dist\WeComSyncAgent.exe` 来自本仓库的打包脚本。
 
 ## 其它平台

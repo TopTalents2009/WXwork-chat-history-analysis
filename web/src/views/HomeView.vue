@@ -5,26 +5,100 @@
       <p class="text-slate-500">先选择电脑，再查看这台电脑同步过来的聊天列表</p>
     </div>
 
-    <div v-if="ingest" class="mb-8 bg-white rounded-2xl border border-slate-200 p-5">
-      <div class="text-sm font-medium text-slate-900 mb-2">远端同步助手</div>
-      <p class="text-sm text-slate-500 mb-3">
-        把 <code class="bg-slate-100 px-1 rounded">WeComSyncAgent.exe</code> 装到对方电脑。
-        助手会默认填写服务器地址并自动获取令牌，勾选群聊/单聊后同步到这里。
-      </p>
-      <div class="grid md:grid-cols-2 gap-3 text-sm">
-        <div>
-          <div class="text-xs text-slate-400 mb-1">服务器地址</div>
-          <div class="flex flex-wrap gap-2">
-            <code
-              v-for="url in ingest.urls"
-              :key="url"
-              class="bg-slate-100 px-2 py-1 rounded"
-            >{{ url }}</code>
+    <div v-if="ingest" class="mb-8 bg-white rounded-2xl border border-slate-200 p-5 space-y-5">
+      <div>
+        <div class="text-sm font-medium text-slate-900 mb-1">局域网打开网页</div>
+        <p class="text-sm text-slate-500 mb-3">
+          手机或其它电脑连同一 WiFi / 网段后，浏览器打开下面的地址即可。不要用 127.0.0.1。
+        </p>
+        <div class="flex flex-wrap gap-2">
+          <button
+            v-for="url in lanWebUrls"
+            :key="url"
+            type="button"
+            class="text-sm bg-primary-50 text-primary-800 px-3 py-1.5 rounded-lg hover:bg-primary-100"
+            @click="copyText(url)"
+          >{{ url }}</button>
+        </div>
+        <p v-if="!lanWebUrls.length" class="text-sm text-amber-700">
+          没有检测到局域网 IP。请确认网线/WiFi 已连接，并用管理员运行 scripts\open_lan_firewall.ps1 放行 5173 端口。
+        </p>
+        <p v-if="copied" class="text-xs text-emerald-600 mt-2">已复制 {{ copied }}</p>
+      </div>
+      <div>
+        <div class="text-sm font-medium text-slate-900 mb-2">远端同步助手</div>
+        <p class="text-sm text-slate-500 mb-3">
+          把 <code class="bg-slate-100 px-1 rounded">WeComSyncAgent.exe</code> 装到对方电脑。
+          助手填写的是 API 地址（8767），勾选群聊/单聊后同步到这里。
+        </p>
+        <div class="grid md:grid-cols-2 gap-3 text-sm">
+          <div>
+            <div class="text-xs text-slate-400 mb-1">同步助手地址</div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="url in lanApiUrls"
+                :key="url"
+                type="button"
+                class="bg-slate-100 px-2 py-1 rounded hover:bg-slate-200"
+                @click="copyText(url)"
+              >{{ url }}</button>
+            </div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400 mb-1">同步令牌</div>
+            <button
+              type="button"
+              class="bg-slate-100 px-2 py-1 rounded break-all text-left hover:bg-slate-200"
+              @click="copyText(ingest.token)"
+            >{{ ingest.token }}</button>
           </div>
         </div>
-        <div>
-          <div class="text-xs text-slate-400 mb-1">同步令牌</div>
-          <code class="bg-slate-100 px-2 py-1 rounded break-all">{{ ingest.token }}</code>
+      </div>
+      <div v-if="ingest.read_api">
+        <div class="text-sm font-medium text-slate-900 mb-1">开放读取 API</div>
+        <p class="text-sm text-slate-500 mb-3">
+          其他人用 API Key 调用 <code class="bg-slate-100 px-1 rounded">/v1</code> 只读聊天记录。
+          请求头 <code class="bg-slate-100 px-1 rounded">X-API-Key</code>，或
+          <code class="bg-slate-100 px-1 rounded">Authorization: Bearer</code>。
+          可在 <code class="bg-slate-100 px-1 rounded">config.jsonc</code> 的
+          <code class="bg-slate-100 px-1 rounded">open_api</code> 里增删 key。
+        </p>
+        <div class="grid md:grid-cols-2 gap-3 text-sm mb-3">
+          <div>
+            <div class="text-xs text-slate-400 mb-1">接口地址</div>
+            <div class="flex flex-wrap gap-2">
+              <button
+                v-for="url in lanReadApiUrls"
+                :key="url"
+                type="button"
+                class="bg-slate-100 px-2 py-1 rounded hover:bg-slate-200"
+                @click="copyText(url)"
+              >{{ url }}</button>
+            </div>
+          </div>
+          <div>
+            <div class="text-xs text-slate-400 mb-1">API Key</div>
+            <div class="space-y-1">
+              <button
+                v-for="item in readApiKeys"
+                :key="item.key"
+                type="button"
+                class="bg-slate-100 px-2 py-1 rounded break-all text-left hover:bg-slate-200 w-full"
+                @click="copyText(item.key)"
+              >
+                <span v-if="item.name && item.name !== 'default'" class="text-slate-500 mr-1">{{ item.name }}</span>
+                {{ item.key }}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div v-if="ingest.read_api.example" class="text-xs">
+          <div class="text-slate-400 mb-1">调用示例（点击复制）</div>
+          <button
+            type="button"
+            class="w-full text-left bg-slate-900 text-slate-100 px-3 py-2 rounded-lg font-mono break-all hover:bg-slate-800"
+            @click="copyText(ingest.read_api.example || '')"
+          >{{ ingest.read_api.example }}</button>
         </div>
       </div>
     </div>
@@ -123,7 +197,7 @@
 </template>
 
 <script setup lang="ts">
-import { inject, onMounted, onUnmounted, ref, type Ref } from 'vue'
+import { computed, inject, onMounted, onUnmounted, ref, type Ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { chatApi, type Source, type Session, type IngestInfo, type PresenceClient } from '../api'
 
@@ -132,10 +206,12 @@ const sources = ref<Source[]>([])
 const sessions = ref<Session[]>([])
 const selectedSource = ref<Source | null>(null)
 const ingest = ref<IngestInfo | null>(null)
+const copied = ref('')
 const loading = ref(true)
 const sessionsLoading = ref(false)
 const online = inject<Ref<PresenceClient[]>>('presenceOnline', ref([]))
 let timer: ReturnType<typeof setInterval> | null = null
+let copiedTimer: ReturnType<typeof setTimeout> | null = null
 
 onMounted(async () => {
   await loadSources(true)
@@ -145,8 +221,60 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (timer) clearInterval(timer)
+  if (copiedTimer) clearTimeout(copiedTimer)
   window.removeEventListener('chatinsight-presence', onPresenceEvent)
 })
+
+function isLoopbackUrl(url: string) {
+  return /:\/\/(127\.0\.0\.1|localhost)(:|$)/i.test(url)
+}
+
+const lanWebUrls = computed(() => {
+  const explicit = (ingest.value?.web_urls || []).filter((url) => !isLoopbackUrl(url))
+  if (explicit.length) return explicit
+  return (ingest.value?.urls || [])
+    .filter((url) => !isLoopbackUrl(url))
+    .map((url) => url.replace(/:8767\/?$/, ':5173'))
+})
+const lanApiUrls = computed(() => (ingest.value?.urls || []).filter((url) => !isLoopbackUrl(url)))
+const lanReadApiUrls = computed(() => {
+  const explicit = (ingest.value?.read_api?.urls || []).filter((url) => !isLoopbackUrl(url))
+  if (explicit.length) return explicit
+  return lanApiUrls.value.map((url) => url.replace(/\/?$/, '') + '/v1')
+})
+const readApiKeys = computed(() => {
+  const info = ingest.value?.read_api
+  if (!info) return []
+  if (info.keys && info.keys.length) return info.keys
+  return info.key ? [{ name: 'default', key: info.key }] : []
+})
+
+async function copyText(value: string) {
+  const text = (value || '').trim()
+  if (!text) return
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      const input = document.createElement('textarea')
+      input.value = text
+      input.setAttribute('readonly', '')
+      input.style.position = 'fixed'
+      input.style.left = '-9999px'
+      document.body.appendChild(input)
+      input.select()
+      document.execCommand('copy')
+      input.remove()
+    }
+    copied.value = text
+    if (copiedTimer) clearTimeout(copiedTimer)
+    copiedTimer = setTimeout(() => {
+      copied.value = ''
+    }, 2000)
+  } catch (e) {
+    console.error(e)
+  }
+}
 
 function onPresenceEvent() {
   loadSources(false)

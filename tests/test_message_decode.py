@@ -90,6 +90,50 @@ class MessageDecodeTests(unittest.TestCase):
         self.assertIn("汇报人：吴贤腾", text)
         self.assertNotEqual(text, "_修改后.docx")
 
+    def test_keeps_short_replies(self):
+        for raw in ("好", "嗯", "好的", "收到", "谢谢", "可以", "哈哈", "ok", "OK", "？"):
+            self.assertFalse(md._is_garbage_text(raw), raw)
+            self.assertEqual(md.recover_display_text(2, raw), raw)
+            self.assertEqual(md.display_message_content(2, raw), raw)
+
+    def test_decodes_wecom_short_protobuf(self):
+        ok_blob = bytes.fromhex("0a08080012040a026f6b")
+        thanks_blob = bytes.fromhex("0a0c080012080a06e5a5bde79a84")
+        recv_blob = bytes.fromhex("0a0c080012080a06e694b6e588b0")
+        self.assertEqual(md.display_message_content(2, ok_blob), "ok")
+        self.assertEqual(md.display_message_content(2, thanks_blob), "好的")
+        self.assertEqual(md.display_message_content(2, recv_blob), "收到")
+
+    def test_keeps_wecom_bracket_emoji(self):
+        blob = bytes.fromhex("0a0e0803120a0a085be68ab1e68bb35d")
+        self.assertEqual(md.display_message_content(2, blob), "[抱拳]")
+
+    def test_still_drops_single_ascii_leftover(self):
+        self.assertTrue(md._is_garbage_text("A"))
+        self.assertEqual(md.recover_display_text(2, "A"), "[文本]")
+
+    def test_keeps_mac_address_and_user_path(self):
+        mac = bytes.fromhex("0a17080012130a1133432d37412d41412d36312d46302d4535")
+        self.assertEqual(md.display_message_content(2, mac), "3C-7A-AA-61-F0-E5")
+        path_blob = bytes.fromhex("0a17080012130a11433a5c55736572735c77755c2e67726f6b")
+        self.assertIn(".grok", md.display_message_content(2, path_blob))
+        self.assertTrue(md._is_noise_text(r"C:\Users\wu\AppData\Local\WXWork\cache"))
+
+    def test_keeps_url_and_id_list(self):
+        url_blob = b"\n/\x08\x00\x12+\n)https://github.com/accten/agent-/issues/1"
+        text = md.display_message_content(2, url_blob)
+        self.assertIn("github.com", text)
+        self.assertFalse(text.startswith(")"))
+        id_list = "23164、50203、53590、51268、40066、54903，40302、30708"
+        self.assertFalse(md._is_garbage_text(id_list))
+        self.assertIn("23164", md.recover_display_text(2, id_list))
+
+    def test_keeps_ipv4_and_emoji(self):
+        self.assertFalse(md._is_app_version("192.168.2.130"))
+        self.assertTrue(md._is_app_version("2.8.18"))
+        self.assertEqual(md.recover_display_text(2, "192.168.2.130"), "192.168.2.130")
+        self.assertIn("👌", md.recover_display_text(2, "👌"))
+
 
 if __name__ == "__main__":
     unittest.main()

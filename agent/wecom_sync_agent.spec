@@ -18,6 +18,7 @@ datas = [(os.path.join(decrypt, name), "tools/wechat-decrypt") for name in decry
 datas.append((os.path.join(project, "core-wecom", "message_decode.py"), "core-wecom"))
 datas.append((os.path.join(project, "core-wecom", "attachments.py"), "core-wecom"))
 datas.append((os.path.join(project, "agent", "VERSION"), "agent"))
+datas.append((os.path.join(project, "agent", "CHANGELOG.md"), "agent"))
 
 a = Analysis(
     [os.path.join(spec_dir, "wecom_sync_agent.py")],

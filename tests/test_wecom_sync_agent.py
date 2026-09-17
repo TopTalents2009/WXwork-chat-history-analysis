@@ -235,6 +235,21 @@ class WecomSyncAgentTests(unittest.TestCase):
             self.assertEqual(data["pid"], 123)
             self.assertEqual(data["args"], ["--background"])
 
+    def test_changelog_since_and_notice_text(self):
+        entries = agent.parse_changelog(
+            "## 2026.09.17.2\n- 打开助手可看更新说明\n\n## 2026.09.17.1\n- 修复短回复\n"
+        )
+        items = agent.changelog_since(entries, "2026.09.16.2", "2026.09.17.2")
+        self.assertEqual([i["version"] for i in items], ["2026.09.17.2", "2026.09.17.1"])
+        text = agent.format_update_notice("2026.09.17.2", items)
+        self.assertIn("已更新到 2026.09.17.2", text)
+        self.assertIn("修复短回复", text)
+        self.assertEqual(agent.changelog_since(entries, "2026.09.17.2", "2026.09.17.2"), [])
+
+    def test_existing_install_without_seen_version(self):
+        self.assertTrue(agent.looks_like_existing_install({"setup_done": True}))
+        self.assertFalse(agent.looks_like_existing_install({}))
+
 
 if __name__ == "__main__":
     unittest.main()

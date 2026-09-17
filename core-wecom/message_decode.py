@@ -71,14 +71,42 @@ def _is_normal_char(ch):
         return True
     if "\u4e00" <= ch <= "\u9fff":
         return True
-    if ch.isascii() and (ch.isalnum() or ch in ".,!?;:()[]【】、。！？；：""''…-_%/@#&*+=<>"):
+    if ch in ".,!?;:()[]【】（）\"'、。！？；：""''…—-_%/@#&*+=<>\\/":
+        return True
+    if ch.isascii() and ch.isalnum():
+        return True
+    code = ord(ch)
+    if 0x1F300 <= code <= 0x1FAFF or 0x2600 <= code <= 0x27BF or code in (0xFE0F, 0x200D):
         return True
     return False
 
 
-def _is_garbage_text(text):
-    if not text or len(text) < 3:
+_SHORT_TEXT_RE = re.compile(
+    r"^(?:"
+    r"[\u4e00-\u9fff]{1,2}"
+    r"|[？！。、，?]"
+    r"|[Oo][Kk]|[Hh][Ii]|[Yy]es|[Nn]o"
+    r"|[+\-]?\d{1,2}"
+    r")$"
+)
+
+
+def _is_readable_short(text):
+    """True for real chat replies that are only 1-2 characters."""
+    value = (text or "").strip()
+    if _SHORT_TEXT_RE.fullmatch(value):
         return True
+    return bool(value) and all(_is_normal_char(ch) and not ch.isascii() for ch in value) and len(value) <= 4
+
+
+def _is_garbage_text(text):
+    if not text:
+        return True
+    text = text.strip()
+    if not text:
+        return True
+    if len(text) < 3:
+        return not _is_readable_short(text)
 
     if text.count("\ufffd") > 1:
         return True
@@ -101,17 +129,23 @@ def _is_garbage_text(text):
     )
     normal = sum(1 for ch in text if _is_normal_char(ch))
 
+    digits = sum(1 for ch in text if ch.isdigit())
     if hangul >= 2 and hangul > cjk:
         return True
     if weird >= 2 and cjk < 8:
         return True
     if len(text) > 20 and normal / len(text) < 0.45:
         return True
-    if len(text) > 30 and cjk + latin < len(text) * 0.08:
+    if len(text) > 30 and cjk + latin + digits < len(text) * 0.08:
         return True
     if len(text) > 40:
         alnum = sum(1 for ch in text if ch.isalnum())
-        if alnum / len(text) > 0.9 and cjk < 3 and " " not in text[:30]:
+        if (
+            alnum / len(text) > 0.9
+            and cjk < 3
+            and " " not in text[:30]
+            and not re.search(r"[、，。；：]|https?://", text)
+        ):
             return True
     return False
 
@@ -150,11 +184,11 @@ def _decode_text_segment(segment):
     except UnicodeDecodeError:
         return None
     text = _clean_text(text)
-    if len(text) < 2:
+    if not text:
         return None
     if _is_id_token(text) or re.fullmatch(r"[0-9a-fA-F]{32,}", text):
         return None
-    if _is_garbage_text(text):
+    if _is_garbage_text(text) or _is_noise_text(text):
         return None
     printable = sum(1 for ch in text if ch.isprintable() or ch in "\n\t")
     if printable / max(len(text), 1) < 0.9:
@@ -187,11 +221,13 @@ def _parse_protobuf_strings(data, depth=0):
                     return []
                 segment = data[pos:pos + length]
                 pos += length
-                text = _decode_text_segment(segment)
-                if text:
-                    out.append(text)
+                nested = _parse_protobuf_strings(segment, depth + 1)
+                if nested:
+                    out.extend(nested)
                 else:
-                    out.extend(_parse_protobuf_strings(segment, depth + 1))
+                    text = _decode_text_segment(segment)
+                    if text:
+                        out.append(text)
             else:
                 return []
             if pos > len(data):
@@ -203,6 +239,8 @@ def _parse_protobuf_strings(data, depth=0):
 
 def _is_id_token(text):
     t = (text or "").strip()
+    if re.fullmatch(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", t):
+        return False
     if not re.fullmatch(r"[A-Za-z0-9_-]{10,24}", t):
         return False
     has_upper = any("A" <= ch <= "Z" for ch in t)
@@ -213,7 +251,7 @@ def _is_id_token(text):
     return (has_upper and has_lower) or (has_digit and (has_upper or has_lower))
 
 
-_APP_VERSION_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){1,3}$")
+_APP_VERSION_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){1,2}$")
 
 
 def _is_app_version(text):
@@ -223,7 +261,7 @@ def _is_app_version(text):
 def _strip_app_version(text):
     if not text:
         return ""
-    text = re.sub(r"(?:^|\n)\d{1,3}(?:\.\d{1,3}){1,3}(?=\n|$)", "", text)
+    text = re.sub(r"(?:^|\n)\d{1,3}(?:\.\d{1,3}){1,2}(?=\n|$)", "", text)
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
@@ -235,7 +273,12 @@ def _is_noise_text(text):
     if re.fullmatch(r"[A-Za-z0-9+/=]{16,}", text):
         return True
     if re.match(r"^[A-Za-z]:\\", text) or text.startswith("\\\\"):
-        return True
+        lower = text.lower().replace("/", "\\")
+        if any(part in lower for part in ("\\appdata\\", "\\wxwork", "\\wedrive", "\\windows\\temp")):
+            return True
+        return False
+    if _URL_RE.search(text):
+        return False
     if text.startswith("/") and "/" in text[1:] and not re.search(r"[\u4e00-\u9fff]", text):
         return True
     return False
@@ -249,6 +292,7 @@ def _strip_proto_prefix(text):
     while prev != text:
         prev = text
         text = text.strip()
+        text = re.sub(r"^[\s/+,.*)]+(?=https?://)", "", text, flags=re.I)
         text = re.sub(r"^['\"`|!@$&*^~\\({]+", "", text)
         text = re.sub(r"^[A-Za-z](?: [A-Za-z])?\n[A-Za-z]", "", text)
         text = re.sub(r"^[A-Za-z] [A-Za-z]\n", "", text)
@@ -598,7 +642,7 @@ def _combine_text_parts(parts):
 def _pick_best_text(parts, filenames):
     combined = _combine_text_parts(parts)
     cjk = sum(1 for ch in combined if "\u4e00" <= ch <= "\u9fff")
-    if combined and (cjk >= 4 or _text_quality(combined) >= 12):
+    if combined and (cjk >= 4 or _text_quality(combined) >= 12 or _is_readable_short(combined)):
         return combined
     if filenames:
         return filenames[0]

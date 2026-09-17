@@ -67,10 +67,21 @@ export interface Source {
   platform: string
 }
 
+export interface ReadApiInfo {
+  enabled: boolean
+  key: string
+  keys?: { name: string; key: string }[]
+  urls: string[]
+  example?: string
+}
+
 export interface IngestInfo {
   token: string
   port: number
   urls: string[]
+  web_port?: number
+  web_urls?: string[]
+  read_api?: ReadApiInfo
 }
 
 export interface PresenceClient {

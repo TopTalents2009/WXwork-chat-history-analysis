@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import socket
 import sqlite3
 import subprocess
@@ -71,6 +72,117 @@ def _read_agent_version() -> str:
 
 
 AGENT_VERSION = _read_agent_version()
+PENDING_UPDATE_FILE = os.path.join(WORK_DIR, "update", "pending.json")
+_CHANGELOG_HEADING = re.compile(r"^##\s+(\S+)")
+_CHANGELOG_BULLET = re.compile(r"^[-*]\s+(.+)$")
+
+
+def _read_changelog_text() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (
+        os.path.join(here, "CHANGELOG.md"),
+        os.path.join(BUNDLE_DIR, "agent", "CHANGELOG.md"),
+        os.path.join(BUNDLE_DIR, "CHANGELOG.md"),
+    ):
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = (f.read() or "").strip()
+            if text:
+                return text
+        except OSError:
+            continue
+    return ""
+
+
+def parse_changelog(text: str) -> list:
+    entries = []
+    current = None
+    for raw in (text or "").splitlines():
+        heading = _CHANGELOG_HEADING.match(raw.strip())
+        if heading:
+            current = {"version": heading.group(1).strip(), "notes": []}
+            entries.append(current)
+            continue
+        if current is None:
+            continue
+        bullet = _CHANGELOG_BULLET.match(raw.strip())
+        if bullet:
+            note = bullet.group(1).strip()
+            if note:
+                current["notes"].append(note)
+    return entries
+
+
+def changelog_since(entries: list, last_seen: str, current: str) -> list:
+    last_parts = parse_version(last_seen or "0")
+    current_parts = parse_version(current or "0")
+    out = []
+    for item in entries:
+        ver = parse_version(item.get("version") or "0")
+        if last_parts < ver <= current_parts:
+            out.append(item)
+    out.sort(key=lambda item: parse_version(item.get("version") or "0"), reverse=True)
+    return out
+
+
+def format_update_notice(current: str, entries: list) -> str:
+    lines = [f"助手已更新到 {current}", ""]
+    for item in entries:
+        version = item.get("version") or ""
+        notes = item.get("notes") or []
+        if version:
+            lines.append(version)
+        for note in notes:
+            lines.append(f"• {note}")
+        if notes or version:
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def looks_like_existing_install(settings: dict) -> bool:
+    if not settings:
+        return False
+    if settings.get("setup_done"):
+        return True
+    if looks_like_real_name(str(settings.get("operator_name") or "")):
+        return True
+    if str(settings.get("token") or "").strip():
+        return True
+    if settings.get("auto_sync_ids"):
+        return True
+    return False
+
+
+def save_pending_update(info: dict) -> None:
+    os.makedirs(os.path.dirname(PENDING_UPDATE_FILE), exist_ok=True)
+    payload = {
+        "version": str((info or {}).get("version") or "").strip(),
+        "notes": str((info or {}).get("notes") or "").strip(),
+        "changelog": (info or {}).get("changelog") or [],
+    }
+    with open(PENDING_UPDATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def load_pending_update() -> dict:
+    if not os.path.isfile(PENDING_UPDATE_FILE):
+        return {}
+    try:
+        with open(PENDING_UPDATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def clear_pending_update() -> None:
+    try:
+        if os.path.isfile(PENDING_UPDATE_FILE):
+            os.remove(PENDING_UPDATE_FILE)
+    except OSError:
+        pass
 
 
 def _load_settings() -> dict:
@@ -957,7 +1069,18 @@ class AgentApp:
         self.status_var = tk.StringVar(value="")
         ttk.Label(auto_row, textvariable=self.status_var).pack(side=tk.RIGHT)
 
+        self.update_banner_var = tk.StringVar(value="")
+        self.update_banner = ttk.Label(
+            frm,
+            textvariable=self.update_banner_var,
+            foreground="#0f766e",
+            wraplength=760,
+            justify="left",
+        )
+        self._update_banner_btn = ttk.Button(frm, text="知道了", command=self._dismiss_update_notice)
+
         btns = ttk.Frame(frm)
+        self.btn_row = btns
         btns.pack(fill=tk.X, pady=8)
         self.decrypt_btn = ttk.Button(btns, text="1. 解密并刷新会话", command=self.start_decrypt)
         self.decrypt_btn.pack(side=tk.LEFT)
@@ -967,6 +1090,7 @@ class AgentApp:
         ttk.Button(btns, text="全选单聊", command=lambda: self._set_kind(False, True)).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="全不选", command=lambda: self._set_all(False)).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="退出应用", command=self.quit_app).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="更新说明", command=self.show_update_notes).pack(side=tk.RIGHT, padx=4)
 
         ttk.Label(frm, text="选择要同步的聊天").pack(anchor="w")
         list_wrap = ttk.Frame(frm)
@@ -995,13 +1119,14 @@ class AgentApp:
             self.log("发现已有解密数据，正在加载会话列表...")
             self.root.after(200, self.reload_conversations)
         if self._hidden:
+            self.root.after(400, self._maybe_show_update_notice)
             if looks_like_real_name(self._operator_name()):
                 self.root.after(1500, self._heartbeat_tick)
             if self.auto_var.get() and looks_like_real_name(self._operator_name()):
                 self.log("已开启每 5 分钟自动同步；请先勾选要同步的会话。")
                 self._schedule_auto(8000)
         else:
-            self.root.after(300, self._prompt_real_name)
+            self.root.after(400, self._startup_visible)
 
     def log(self, text: str):
         line = f"{datetime.now().strftime('%H:%M:%S')} {text}"
@@ -1015,6 +1140,87 @@ class AgentApp:
                 f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
         except OSError:
             pass
+
+    def _update_notice_text(self) -> str:
+        last_seen = str(self.settings.get("last_seen_version") or "").strip()
+        if not last_seen:
+            if looks_like_existing_install(self.settings):
+                last_seen = "0"
+            else:
+                return ""
+        if parse_version(AGENT_VERSION) <= parse_version(last_seen):
+            return ""
+        entries = parse_changelog(_read_changelog_text())
+        pending = load_pending_update()
+        if pending.get("changelog"):
+            entries = pending.get("changelog") or entries
+        elif str(pending.get("notes") or "").strip():
+            notes = [
+                line.strip("•- ").strip()
+                for line in str(pending.get("notes")).splitlines()
+                if line.strip()
+            ]
+            if notes:
+                entries = [{"version": pending.get("version") or AGENT_VERSION, "notes": notes}]
+        items = changelog_since(entries, last_seen, AGENT_VERSION)
+        if not items:
+            items = [{"version": AGENT_VERSION, "notes": ["助手已自动更新到此版本。"]}]
+        return format_update_notice(AGENT_VERSION, items)
+
+    def _show_update_banner(self, text: str):
+        self.update_banner_var.set(text)
+        if not self.update_banner.winfo_manager():
+            self.update_banner.pack(fill=tk.X, pady=(8, 0), before=self.btn_row)
+            self._update_banner_btn.pack(anchor="e", pady=(2, 4), before=self.btn_row)
+
+    def _dismiss_update_notice(self):
+        self.settings["last_seen_version"] = AGENT_VERSION
+        self._persist_settings()
+        clear_pending_update()
+        try:
+            self.update_banner.pack_forget()
+            self._update_banner_btn.pack_forget()
+        except tk.TclError:
+            pass
+        self.update_banner_var.set("")
+
+    def _maybe_show_update_notice(self):
+        text = self._update_notice_text()
+        if not text:
+            if not str(self.settings.get("last_seen_version") or "").strip():
+                self.settings["last_seen_version"] = AGENT_VERSION
+                self._persist_settings()
+            return
+        for line in text.splitlines():
+            if line.strip():
+                self.log(line)
+        if self._hidden:
+            return
+        self._show_update_banner(text)
+        try:
+            messagebox.showinfo("助手已更新", text, parent=self.root)
+        except tk.TclError:
+            return
+        self._dismiss_update_notice()
+
+    def show_update_notes(self):
+        entries = parse_changelog(_read_changelog_text())
+        pending = load_pending_update()
+        if not entries and pending.get("changelog"):
+            entries = pending.get("changelog")
+        if not entries:
+            notes = str(pending.get("notes") or "").strip()
+            entries = [{
+                "version": AGENT_VERSION,
+                "notes": [notes] if notes else ["当前没有更多更新说明。"],
+            }]
+        text = format_update_notice(AGENT_VERSION, entries[:8])
+        if self._hidden:
+            self.show_window()
+        try:
+            messagebox.showinfo("更新说明", text, parent=self.root)
+        except tk.TclError:
+            self.log(text)
 
     def _notify(self, title: str, message: str, kind: str = "info"):
         if self._hidden:
@@ -1030,7 +1236,12 @@ class AgentApp:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        self._maybe_show_update_notice()
         self.root.after(200, self._prompt_real_name)
+
+    def _startup_visible(self):
+        self._maybe_show_update_notice()
+        self._prompt_real_name()
 
     def _prompt_real_name(self):
         if self._hidden:
@@ -1160,6 +1371,7 @@ class AgentApp:
             "auto_sync": bool(self.auto_var.get()),
             "auto_sync_ids": self._checked_ids(),
             "setup_done": bool(self.settings.get("setup_done")),
+            "last_seen_version": str(self.settings.get("last_seen_version") or ""),
         }
         self.settings = data
         _save_settings(data)
@@ -1248,6 +1460,7 @@ class AgentApp:
                 str(info.get("sha256") or ""),
             )
             extra = ["--background"] if ("--background" in sys.argv or self._hidden) else []
+            save_pending_update(info)
             apply_downloaded_update(new_path, app_executable(), extra)
             self.root.after(0, lambda: self.log(
                 f"新版本 {info.get('version')} 已就绪，正在重启助手"

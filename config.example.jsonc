@@ -84,5 +84,16 @@
     "include_cache": false,
     // 远端同步助手推送数据时使用的令牌。留空则自动生成到 export/ingest_token.txt
     "ingest_token": ""
+  },
+  // 给其他人通过 HTTP 读取聊天记录。网页界面仍走 /api，不需要这个 key。
+  "open_api": {
+    // false 时关闭 /v1 读取接口。
+    "enabled": true,
+    // 主 API Key。留空则自动生成到 export/api_read_key.txt
+    "read_key": "",
+    // 可选：再发几把独立的 key，删掉即可作废。
+    "keys": [
+      // {"name": "同事A", "key": "ci_replace_me", "enabled": true}
+    ]
   }
 }
