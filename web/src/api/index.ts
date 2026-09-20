@@ -90,6 +90,7 @@ export interface PresenceClient {
   computer_name: string
   host: string
   last_seen: string
+  status?: string
 }
 
 export interface PresenceAlert {
@@ -134,7 +135,7 @@ export const chatApi = {
     session_id?: string
     limit?: number
   }) => api.get<SearchHit[]>('/search', { params }),
-  getSourceSessions: (sourceId: string, limit = 200) =>
+  getSourceSessions: (sourceId: string, limit = 1000) =>
     api.get<Session[]>(`/sources/${encodeURIComponent(sourceId)}/sessions`, { params: { limit } }),
   getSourceMessages: (sourceId: string, sessionId: string, params?: {
     start_date?: string

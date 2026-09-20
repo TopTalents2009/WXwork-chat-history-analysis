@@ -332,7 +332,7 @@ async function loadMessages() {
   previewUrl.value = ''
   downloadState.value = {}
   try {
-    const params: Record<string, any> = { limit: 1000 }
+    const params: Record<string, any> = { limit: 5000 }
     if (startDate.value) params.start_date = startDate.value
     if (endDate.value) params.end_date = endDate.value
     const { data } = await chatApi.getSourceMessages(sourceId, sessionId, params)

@@ -123,6 +123,53 @@ class SyncedStoreTests(unittest.TestCase):
         sessions = synced_store.list_sessions(result["source_id"])
         self.assertEqual(sessions[0]["display_name"], "家")
 
+    def test_merge_keeps_old_messages(self):
+        first = synced_store.save_ingest({
+            "computer_name": "PC-M",
+            "sessions": [{
+                "id": "S:1_2",
+                "display_name": "张三",
+                "session_type": 1,
+                "messages": [{"message_id": 1, "text": "old", "time_text": "2026-01-01 10:00"}],
+            }],
+        })
+        synced_store.save_ingest({
+            "computer_name": "PC-M",
+            "sessions": [{
+                "id": "S:1_2",
+                "display_name": "张三",
+                "session_type": 1,
+                "messages": [{"message_id": 2, "text": "new", "time_text": "2026-01-02 10:00"}],
+            }],
+        })
+        messages = synced_store.list_messages(first["source_id"], "S:1_2", limit=0)
+        self.assertEqual([m["text"] for m in messages], ["old", "new"])
+
+    def test_list_messages_returns_latest_window(self):
+        items = [
+            {"message_id": i, "text": str(i), "time_text": f"2026-01-01 10:{i:02d}"}
+            for i in range(5)
+        ]
+        result = synced_store.save_ingest({
+            "computer_name": "PC-L",
+            "sessions": [{"id": "S:9", "display_name": "李四", "messages": items}],
+        })
+        latest = synced_store.list_messages(result["source_id"], "S:9", limit=2)
+        self.assertEqual([m["text"] for m in latest], ["3", "4"])
+
+    def test_find_source_id_reuses_computer_without_account(self):
+        synced_store.save_ingest({
+            "computer_name": "SKY-PC",
+            "account_id": "1688850000000001",
+            "operator_name": "唐利萍",
+            "host": "192.168.2.11",
+            "sessions": [{"id": "S:1", "display_name": "张三", "messages": [{"text": "hi"}]}],
+        })
+        self.assertEqual(
+            synced_store.find_source_id("SKY-PC", "", "192.168.2.11"),
+            "SKY-PC-1688850000000001",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

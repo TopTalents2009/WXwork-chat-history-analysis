@@ -29,7 +29,7 @@
         <div class="text-sm font-medium text-slate-900 mb-2">远端同步助手</div>
         <p class="text-sm text-slate-500 mb-3">
           把 <code class="bg-slate-100 px-1 rounded">WeComSyncAgent.exe</code> 装到对方电脑。
-          助手填写的是 API 地址（8767），勾选群聊/单聊后同步到这里。
+          助手填写的是 API 地址（8767），会同步全部群聊和单聊到这里。
         </p>
         <div class="grid md:grid-cols-2 gap-3 text-sm">
           <div>
@@ -122,7 +122,14 @@
             <div class="flex items-center gap-2 min-w-0">
               <h3 class="text-lg font-semibold text-slate-900 truncate">{{ sourceTitle(source) }}</h3>
               <span
-                v-if="isOnline(source)"
+                v-if="isUpdating(source)"
+                class="inline-flex items-center gap-1 shrink-0 text-sm font-medium text-amber-600"
+              >
+                <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                更新中
+              </span>
+              <span
+                v-else-if="isOnline(source)"
                 class="inline-flex items-center gap-1 shrink-0 text-sm font-medium text-emerald-600"
               >
                 <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
@@ -145,7 +152,14 @@
         <h2 class="text-xl font-semibold text-slate-900 flex items-center gap-2">
           <span>{{ sourceTitle(selectedSource) }}</span>
           <span
-            v-if="isOnline(selectedSource)"
+            v-if="isUpdating(selectedSource)"
+            class="inline-flex items-center gap-1 text-sm font-medium text-amber-600"
+          >
+            <span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+            更新中
+          </span>
+          <span
+            v-else-if="isOnline(selectedSource)"
             class="inline-flex items-center gap-1 text-sm font-medium text-emerald-600"
           >
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
@@ -317,19 +331,29 @@ function sourceKindLabel(source: Source) {
   return '本机'
 }
 
-function isOnline(source: Source) {
+function presenceMatch(source: Source) {
   const list = online.value || []
-  const computer = (source.computer_name || "").replace(/（本机）|（SSH）/g, "")
-  return list.some((item) => {
+  const computer = (source.computer_name || "").replace(/（本机）|（SSH）/g, "").trim()
+  const host = (source.host || "").trim()
+  return list.find((item) => {
     if (item.source_id && item.source_id === source.id) return true
     if (source.operator_name && item.operator_name && source.operator_name === item.operator_name) {
       return true
     }
-    if (item.computer_name && computer && computer.includes(item.computer_name)) {
-      return true
-    }
+    const name = (item.computer_name || "").trim()
+    if (name && computer && (computer === name || computer.includes(name))) return true
+    if (host && item.host && host === item.host) return true
     return false
   })
+}
+
+function isUpdating(source: Source) {
+  return presenceMatch(source)?.status === "updating"
+}
+
+function isOnline(source: Source) {
+  const hit = presenceMatch(source)
+  return Boolean(hit) && hit?.status !== "updating"
 }
 
 function isFreshSync(session: Session) {

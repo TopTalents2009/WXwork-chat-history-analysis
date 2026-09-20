@@ -21,6 +21,47 @@ def source_id_for(computer_name: str, account_id: str = "") -> str:
     return _safe_id(f"{computer_name}-{account_id}" if account_id else computer_name)
 
 
+def find_source_id(computer_name: str = "", account_id: str = "", host: str = "") -> str:
+    """Reuse an existing synced folder when the agent has no account_id yet."""
+    account_id = str(account_id or "").strip()
+    computer_name = (computer_name or "").strip()
+    host = (host or "").strip()
+    if account_id:
+        return source_id_for(computer_name, account_id)
+    for src in list_sources():
+        if computer_name and (src.get("computer_name") or "") == computer_name:
+            return src["id"]
+        if host and (src.get("host") or "") == host:
+            return src["id"]
+    return source_id_for(computer_name, account_id)
+
+
+def _message_key(item: dict) -> str:
+    mid = int(item.get("message_id") or 0)
+    if mid:
+        return f"id:{mid}"
+    text = str(item.get("text") or "")[:80]
+    return f"t:{item.get('time_text') or ''}|{item.get('sender') or ''}|{text}"
+
+
+def merge_messages(old: list, new: list) -> list:
+    """Keep the union of old and new messages; the latest payload wins on id clash."""
+    by_key = {}
+    order = []
+    for item in list(old or []) + list(new or []):
+        if not isinstance(item, dict):
+            continue
+        key = _message_key(item)
+        if key in by_key:
+            by_key[key] = item
+            continue
+        order.append(key)
+        by_key[key] = item
+    merged = [by_key[key] for key in order]
+    merged.sort(key=lambda m: (str(m.get("time_text") or ""), int(m.get("message_id") or 0)))
+    return merged
+
+
 def _source_dir(source_id: str) -> str:
     return os.path.join(SYNCED_ROOT, _safe_id(source_id))
 
@@ -94,14 +135,17 @@ def save_ingest(payload: dict) -> dict:
         sid = str(item.get("id") or item.get("username") or "")
         if not sid:
             continue
-        messages = [_sanitize_stored_message(m) for m in (item.get("messages") or [])]
-        _write_json(os.path.join(folder, "messages", _safe_id(sid) + ".json"), messages)
+        messages_path = os.path.join(folder, "messages", _safe_id(sid) + ".json")
+        incoming_messages = [_sanitize_stored_message(m) for m in (item.get("messages") or [])]
+        existing_messages = _read_json(messages_path, [])
+        messages = merge_messages(existing_messages, incoming_messages)
+        _write_json(messages_path, messages)
         existing_sessions[sid] = {
             "username": sid,
             "display_name": item.get("display_name") or sid,
             "session_type": int(item.get("session_type") or 0),
             "last_time": item.get("last_time") or "",
-            "msg_count": int(item.get("msg_count") or len(messages)),
+            "msg_count": len(messages),
             "summary": item.get("summary") or "",
             "synced_at": now,
             "sync_seq": sync_seq,
@@ -175,11 +219,15 @@ def list_messages(source_id: str, session_id: str, limit: int = 1000) -> List[di
     if changed:
         _write_json(path, cleaned)
         messages = cleaned
-    return messages[:limit]
+    if not limit or int(limit) <= 0:
+        return messages
+    if len(messages) > int(limit):
+        return messages[-int(limit):]
+    return messages
 
 
 def get_message(source_id: str, session_id: str, message_id: int) -> Optional[dict]:
-    for item in list_messages(source_id, session_id, limit=5000):
+    for item in list_messages(source_id, session_id, limit=0):
         if int(item.get("message_id") or 0) == int(message_id):
             return item
     return None

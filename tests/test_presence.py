@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import os
+import tempfile
 import unittest
 
 from shared.presence import PresenceHub, display_who
@@ -57,6 +59,40 @@ class PresenceHubTests(unittest.TestCase):
         self.assertIn("sync", kinds)
         sync = [a for a in hub.snapshot()["alerts"] if a["kind"] == "sync"][0]
         self.assertIn("家", sync["message"])
+
+    def test_presence_survives_restart(self):
+        clock = Clock()
+        folder = tempfile.TemporaryDirectory()
+        path = os.path.join(folder.name, "presence.json")
+        hub = PresenceHub(now=clock.now, persist_path=path)
+        hub.heartbeat("pc-a", "张三", "PC-A", "192.168.2.14")
+        restored = PresenceHub(now=clock.now, persist_path=path)
+        snapshot = restored.snapshot()
+        self.assertEqual(snapshot["online"][0]["source_id"], "pc-a")
+        self.assertEqual(snapshot["online"][0]["operator_name"], "张三")
+        folder.cleanup()
+
+    def test_known_clients_keep_offline_machine(self):
+        clock = Clock()
+        hub = PresenceHub(now=clock.now)
+        hub.heartbeat("sky", "唐利萍", "SKY-PC", "192.168.2.11")
+        clock.advance(120)
+        self.assertEqual(hub.snapshot()["online"], [])
+        known = hub.known_clients()
+        self.assertEqual(known[0]["source_id"], "sky")
+        self.assertEqual(known[0]["operator_name"], "唐利萍")
+
+    def test_updating_stays_visible(self):
+        clock = Clock()
+        hub = PresenceHub(now=clock.now)
+        hub.heartbeat("pc-a", "张三", "PC-A", "192.168.2.14")
+        self.assertEqual(hub.mark_updating_by_host("192.168.2.14"), 1)
+        clock.advance(120)
+        snapshot = hub.snapshot()
+        self.assertEqual(len(snapshot["online"]), 1)
+        self.assertEqual(snapshot["online"][0]["status"], "updating")
+        clock.advance(15 * 60)
+        self.assertEqual(hub.snapshot()["online"], [])
 
 
 if __name__ == "__main__":

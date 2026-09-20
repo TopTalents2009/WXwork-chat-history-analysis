@@ -1,4 +1,6 @@
 """In-memory online presence and sync alerts for remote WeCom agents."""
+import json
+import os
 from collections import deque
 from datetime import datetime
 from threading import Lock
@@ -6,6 +8,7 @@ from typing import Callable, Optional
 
 
 ONLINE_TTL_SEC = 90
+UPDATING_TTL_SEC = 15 * 60
 MAX_ALERTS = 50
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -19,16 +22,56 @@ class PresenceHub:
         self,
         now: Optional[Callable[[], datetime]] = None,
         on_alert: Optional[Callable[[dict], None]] = None,
+        persist_path: str = "",
     ):
         self._now = now or datetime.now
         self.on_alert = on_alert
+        self._persist_path = persist_path or ""
         self._lock = Lock()
         self._clients: dict = {}
         self._alerts: deque = deque(maxlen=MAX_ALERTS)
         self._seq = 0
+        self._load()
 
     def _stamp(self) -> str:
         return self._now().strftime(TIME_FMT)
+
+    def _load(self) -> None:
+        path = self._persist_path
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError, TypeError):
+            return
+        clients = data.get("clients") if isinstance(data, dict) else None
+        if isinstance(clients, dict):
+            self._clients = {
+                str(key): dict(value)
+                for key, value in clients.items()
+                if isinstance(value, dict)
+            }
+        try:
+            self._seq = int(data.get("seq") or 0)
+        except (TypeError, ValueError):
+            self._seq = 0
+
+    def _save_unlocked(self) -> None:
+        path = self._persist_path
+        if not path:
+            return
+        try:
+            folder = os.path.dirname(path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            tmp = path + ".tmp"
+            payload = {"clients": self._clients, "seq": self._seq}
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     def _parse(self, text: str) -> datetime:
         try:
@@ -36,8 +79,9 @@ class PresenceHub:
         except (TypeError, ValueError):
             return datetime.min
 
-    def _fresh(self, last_seen: str, now: datetime) -> bool:
-        return (now - self._parse(last_seen)).total_seconds() <= ONLINE_TTL_SEC
+    def _fresh(self, last_seen: str, now: datetime, status: str = "") -> bool:
+        ttl = UPDATING_TTL_SEC if status == "updating" else ONLINE_TTL_SEC
+        return (now - self._parse(last_seen)).total_seconds() <= ttl
 
     def _push_alert(self, kind: str, title: str, message: str, extra: Optional[dict] = None) -> dict:
         self._seq += 1
@@ -64,19 +108,28 @@ class PresenceHub:
         operator_name: str = "",
         computer_name: str = "",
         host: str = "",
+        status: str = "online",
     ) -> dict:
         source_id = str(source_id or "").strip() or "pc"
         who = display_who(operator_name, computer_name)
+        status = str(status or "online").strip() or "online"
+        if status not in ("online", "updating"):
+            status = "online"
         with self._lock:
             now = self._now()
             prev = self._clients.get(source_id)
-            was_online = bool(prev) and self._fresh(prev.get("last_seen") or "", now)
+            was_online = bool(prev) and self._fresh(
+                prev.get("last_seen") or "",
+                now,
+                prev.get("status") or "",
+            )
             self._clients[source_id] = {
                 "source_id": source_id,
                 "operator_name": (operator_name or "").strip(),
                 "computer_name": (computer_name or "").strip(),
                 "host": (host or "").strip(),
                 "last_seen": now.strftime(TIME_FMT),
+                "status": status,
             }
             alert = None
             if not was_online:
@@ -86,7 +139,25 @@ class PresenceHub:
                     f"{who}（{computer_name or source_id}）正在连接服务器",
                     {"source_id": source_id},
                 )
+            self._save_unlocked()
         return {"ok": True, "online": True, "alert": alert}
+
+    def mark_updating_by_host(self, host: str) -> int:
+        host = (host or "").strip()
+        if not host:
+            return 0
+        changed = 0
+        with self._lock:
+            now = self._now().strftime(TIME_FMT)
+            for client in self._clients.values():
+                if (client.get("host") or "") != host:
+                    continue
+                client["status"] = "updating"
+                client["last_seen"] = now
+                changed += 1
+            if changed:
+                self._save_unlocked()
+        return changed
 
     def mark_offline(self, source_id: str) -> dict:
         source_id = str(source_id or "").strip()
@@ -101,6 +172,7 @@ class PresenceHub:
                 f"{who} 已停止同步",
                 {"source_id": source_id},
             )
+            self._save_unlocked()
         return {"ok": True, "online": False, "alert": alert}
 
     def note_sync(
@@ -135,8 +207,14 @@ class PresenceHub:
             now = self._now()
             online = []
             for source_id, client in self._clients.items():
-                if self._fresh(client.get("last_seen") or "", now):
+                if self._fresh(client.get("last_seen") or "", now, client.get("status") or ""):
                     online.append(dict(client))
             alerts = [dict(item) for item in self._alerts if int(item.get("id") or 0) > int(since_id or 0)]
         online.sort(key=lambda c: c.get("last_seen") or "", reverse=True)
         return {"online": online, "alerts": alerts}
+
+    def known_clients(self) -> list:
+        with self._lock:
+            clients = [dict(item) for item in self._clients.values()]
+        clients.sort(key=lambda c: c.get("last_seen") or "", reverse=True)
+        return clients

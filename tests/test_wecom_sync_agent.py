@@ -52,21 +52,37 @@ class WecomSyncAgentTests(unittest.TestCase):
             info = agent.fetch_ingest_info("http://192.168.2.25:8767")
         self.assertEqual(info["token"], "abc123")
 
-    def test_auto_sync_skips_when_none_checked(self):
+    def test_auto_sync_all_when_none_checked(self):
         rows = [
             {"id": "R:1", "display_name": "家"},
             {"id": "2", "display_name": "张三"},
         ]
         selected = agent.sessions_for_auto_sync(rows, [])
-        self.assertEqual(selected, [])
+        self.assertEqual([s["id"] for s in selected], ["R:1", "2"])
+
+    def test_auto_sync_includes_new_direct_chats(self):
+        rows = [
+            {"id": "R:1", "display_name": "家"},
+            {"id": "2", "display_name": "张三"},
+        ]
+        selected = agent.sessions_for_auto_sync(rows, ["R:1"], seen_ids=["R:1"])
+        self.assertEqual([s["id"] for s in selected], ["R:1", "2"])
 
     def test_auto_sync_filters_checked_ids(self):
         rows = [
             {"id": "R:1", "display_name": "家"},
             {"id": "2", "display_name": "张三"},
         ]
-        selected = agent.sessions_for_auto_sync(rows, ["2"])
+        selected = agent.sessions_for_auto_sync(rows, ["2"], seen_ids=["R:1", "2"])
         self.assertEqual([s["id"] for s in selected], ["2"])
+
+    def test_checked_ids_for_render_includes_unseen_direct(self):
+        rows = [
+            {"id": "R:1", "display_name": "家"},
+            {"id": "2", "display_name": "张三"},
+        ]
+        checked = agent.checked_ids_for_render(rows, ["R:1"], ["R:1"])
+        self.assertEqual(checked, ["R:1", "2"])
 
     def test_auto_sync_interval_is_five_minutes(self):
         self.assertEqual(agent.AUTO_SYNC_INTERVAL_MS, 5 * 60 * 1000)
@@ -229,6 +245,11 @@ class WecomSyncAgentTests(unittest.TestCase):
             with mock.patch.object(agent, "WORK_DIR", tmp):
                 script = agent.write_updater_script(123, os.path.join(tmp, "new.exe"), r"C:\app\WeComSyncAgent.exe", ["--background"])
             self.assertTrue(os.path.isfile(script))
+            with open(script, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("Copy-Item", text)
+            self.assertIn("--background", text)
+            self.assertIn("Start-Process", text)
             plan = os.path.join(tmp, "update", "plan.json")
             with open(plan, encoding="utf-8") as f:
                 data = json.load(f)

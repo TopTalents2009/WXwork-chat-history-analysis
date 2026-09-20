@@ -1,5 +1,6 @@
-# Allow inbound TCP for the ChatInsight web UI and API.
+﻿# Allow inbound TCP for the ChatInsight web UI and API.
 # Run as Administrator once if start.ps1 could not add the rules.
+# Saved as UTF-8 with BOM so Windows PowerShell 5.1 can parse it.
 param(
     [int[]]$Ports = @(5173, 8767)
 )
@@ -11,9 +12,7 @@ function Ensure-ChatInsightFirewallRule([int]$Port) {
     $existing = Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue
     if ($existing) {
         Set-NetFirewallRule -DisplayName $name -Enabled True -Profile Any -ErrorAction SilentlyContinue | Out-Null
-        Get-NetFirewallPortFilter -AssociatedNetFirewallRule $existing -ErrorAction SilentlyContinue |
-            ForEach-Object { $_ } | Out-Null
-        Write-Host "已存在: $name" -ForegroundColor Green
+        Write-Host "Rule exists: $name" -ForegroundColor Green
         return
     }
     New-NetFirewallRule `
@@ -24,12 +23,13 @@ function Ensure-ChatInsightFirewallRule([int]$Port) {
         -LocalPort $Port `
         -Profile Any `
         -ErrorAction Stop | Out-Null
-    Write-Host "已放行: $name" -ForegroundColor Green
+    Write-Host "Opened: $name" -ForegroundColor Green
 }
 
 foreach ($port in $Ports) {
     Ensure-ChatInsightFirewallRule $port
 }
 
+$portText = ($Ports | ForEach-Object { [string]$_ }) -join ", "
 Write-Host ""
-Write-Host "其它电脑可用浏览器打开本机局域网地址，端口 $Ports。" -ForegroundColor Cyan
+Write-Host ("LAN browsers can use this PC IP. TCP ports: " + $portText) -ForegroundColor Cyan

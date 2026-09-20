@@ -315,14 +315,69 @@ def _desktop_alert(alert: dict) -> None:
     ).start()
 
 
-presence = PresenceHub(on_alert=_desktop_alert)
+presence = PresenceHub(
+    on_alert=_desktop_alert,
+    persist_path=os.path.join(PROJECT_DIR, "export", "presence.json"),
+)
 
 
 def _client_source_id(payload: dict) -> str:
     computer_name = (payload.get("computer_name") or socket.gethostname()).strip()
     account_id = str(payload.get("account_id") or "")
-    source_id = payload.get("source_id") or synced_store.source_id_for(computer_name, account_id)
-    return synced_store._safe_id(source_id)
+    host = str(payload.get("host") or "")
+    return synced_store.find_source_id(computer_name, account_id, host)
+
+
+def _peer_host(request: Request, payload: Optional[dict] = None) -> str:
+    peer = request.client.host if request.client else ""
+    reported = str((payload or {}).get("host") or "")
+    if peer and peer not in ("127.0.0.1", "::1"):
+        return peer
+    return reported or peer
+
+
+def _bare_computer(name: str) -> str:
+    return (name or "").replace("（本机）", "").replace("（SSH）", "").strip()
+
+
+def _local_ip_set() -> set:
+    return set(lan.list_lan_ipv4())
+
+
+def _same_machine(computer: str, host: str, other_computer: str, other_host: str) -> bool:
+    left = _bare_computer(computer)
+    right = _bare_computer(other_computer)
+    if left and right and left.lower() == right.lower():
+        return True
+    if host and other_host and host == other_host:
+        return True
+    return False
+
+
+def _is_this_pc(computer: str, host: str, local: Optional[dict], local_ips: Optional[set] = None) -> bool:
+    if not local:
+        return False
+    if _same_machine(computer, host, local.get("computer_name") or "", local.get("host") or ""):
+        return True
+    ips = local_ips if local_ips is not None else _local_ip_set()
+    return bool(host) and host in ips
+
+
+def _enrich_local_source(local: dict, clients: list) -> dict:
+    ips = _local_ip_set()
+    for client in clients:
+        computer = str(client.get("computer_name") or "")
+        host = str(client.get("host") or "")
+        if not _is_this_pc(computer, host, local, ips):
+            continue
+        name = str(client.get("operator_name") or "").strip()
+        if name:
+            local["operator_name"] = name
+            local["username"] = name
+        if host:
+            local["host"] = host
+        break
+    return local
 
 
 def _local_source() -> Optional[dict]:
@@ -341,7 +396,7 @@ def _local_source() -> Optional[dict]:
         except Exception:
             encrypted = False
         if not encrypted:
-            sessions = plat.list_sessions(limit=500)
+            sessions = plat.list_sessions(limit=5000)
         computer = socket.gethostname()
         kind = "local"
         host = ""
@@ -421,11 +476,60 @@ async def ingest_info():
 @app.get("/api/sources")
 async def list_sources():
     items = []
+    seen = set()
+    known = presence.known_clients()
+    local_ips = _local_ip_set()
     local = _local_source()
     if local:
+        _enrich_local_source(local, known)
         items.append(SourceInfo(**local))
+        seen.add(local["id"])
     for src in synced_store.list_sources():
+        if _is_this_pc(src.get("computer_name") or "", src.get("host") or "", local, local_ips):
+            seen.add(src["id"])
+            continue
         items.append(SourceInfo(**src))
+        seen.add(src["id"])
+    online_ids = {
+        str(item.get("source_id") or "")
+        for item in (presence.snapshot().get("online") or [])
+    }
+    for client in known:
+        sid = str(client.get("source_id") or "").strip()
+        computer = str(client.get("computer_name") or "").strip()
+        host = str(client.get("host") or "").strip()
+        if sid and sid in seen:
+            continue
+        if _is_this_pc(computer, host, local, local_ips):
+            continue
+        already = False
+        for item in items:
+            if _same_machine(computer, host, item.computer_name, item.host):
+                already = True
+                break
+        if already:
+            continue
+        if not sid:
+            sid = synced_store.source_id_for(computer or "pc", "")
+        last_seen = str(client.get("last_seen") or "").strip()
+        if sid in online_ids:
+            last_sync = "在线，尚未同步聊天"
+        elif last_seen:
+            last_sync = f"{last_seen} 曾在线"
+        else:
+            last_sync = "尚未同步聊天"
+        items.insert(0 if not local else 1, SourceInfo(
+            id=sid,
+            kind="remote",
+            computer_name=computer or sid,
+            operator_name=str(client.get("operator_name") or ""),
+            username=str(client.get("operator_name") or ""),
+            host=host,
+            last_sync=last_sync,
+            session_count=0,
+            platform="wecom",
+        ))
+        seen.add(sid)
     return items
 
 
@@ -452,14 +556,19 @@ async def ingest_wecom(payload: dict, x_ingest_token: Optional[str] = Header(Non
 
 
 @app.post("/api/ingest/heartbeat")
-async def ingest_heartbeat(payload: dict, x_ingest_token: Optional[str] = Header(None)):
+async def ingest_heartbeat(
+    payload: dict,
+    request: Request,
+    x_ingest_token: Optional[str] = Header(None),
+):
     _check_ingest_token(str(payload.get("token") or ""), x_ingest_token or "")
     source_id = _client_source_id(payload)
     result = presence.heartbeat(
         source_id,
         payload.get("operator_name") or "",
         payload.get("computer_name") or "",
-        payload.get("host") or "",
+        _peer_host(request, payload),
+        str(payload.get("status") or "online"),
     )
     result["source_id"] = source_id
     result["jobs"] = file_jobs.hub.pending_for(source_id)
@@ -532,6 +641,7 @@ async def ingest_agent_update():
 
 @app.get("/api/ingest/agent-exe")
 def ingest_agent_exe(
+    request: Request,
     x_ingest_token: Optional[str] = Header(None),
     token: str = Query(""),
 ):
@@ -539,6 +649,8 @@ def ingest_agent_exe(
     path = agent_update.agent_exe_path(PROJECT_DIR)
     if not path:
         raise HTTPException(status_code=404, detail="agent exe not published")
+    host = request.client.host if request.client else ""
+    presence.mark_updating_by_host(host)
     return FileResponse(
         path,
         filename="WeComSyncAgent.exe",
@@ -592,7 +704,7 @@ async def search_source_messages(
 
 
 @app.get("/api/sources/{source_id}/sessions")
-async def list_source_sessions(source_id: str, limit: int = Query(200, ge=1, le=1000)):
+async def list_source_sessions(source_id: str, limit: int = Query(1000, ge=1, le=5000)):
     if source_id == "local":
         plat = _get_platform("wecom")
         sessions = plat.list_sessions(limit=limit)
@@ -625,7 +737,7 @@ async def get_source_messages(
     session_id: str,
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
-    limit: int = Query(1000, ge=1, le=5000),
+    limit: int = Query(5000, ge=1, le=20000),
 ):
     if source_id == "local":
         plat = _get_platform("wecom")
@@ -668,7 +780,7 @@ async def v1_sources(_auth: dict = Depends(require_read_api_key)):
 @app.get("/v1/sources/{source_id}/sessions")
 async def v1_source_sessions(
     source_id: str,
-    limit: int = Query(200, ge=1, le=1000),
+    limit: int = Query(1000, ge=1, le=5000),
     _auth: dict = Depends(require_read_api_key),
 ):
     items = await list_source_sessions(source_id, limit)
@@ -685,7 +797,7 @@ async def v1_source_messages(
     limit: int = Query(200, ge=1, le=1000),
     _auth: dict = Depends(require_read_api_key),
 ):
-    fetch_limit = 5000 if (start_date or end_date or offset) else limit
+    fetch_limit = 20000 if (start_date or end_date or offset) else limit
     rows = await get_source_messages(source_id, session_id, start_date, end_date, fetch_limit)
     data, total = _filter_v1_messages(rows, start_date, end_date, offset, limit)
     return _v1_ok(
@@ -744,7 +856,7 @@ async def get_source_stats(
 
 
 @app.get("/api/{platform}/sessions")
-async def list_sessions(platform: str, limit: int = Query(100, ge=1, le=1000)):
+async def list_sessions(platform: str, limit: int = Query(1000, ge=1, le=5000)):
     plat = _get_platform(platform)
     sessions = plat.list_sessions(limit=limit)
     return [SessionResponse(
@@ -850,7 +962,7 @@ async def get_stats(
 @app.get("/api/{platform}/groups")
 async def list_groups(platform: str):
     plat = _get_platform(platform)
-    sessions = plat.list_sessions(limit=500)
+    sessions = plat.list_sessions(limit=5000)
     groups = [s for s in sessions if "@chatroom" in s.username or s.session_type == 2]
     return [SessionResponse(
         username=s.username,
@@ -905,32 +1017,32 @@ def download_source_attachment(
         cached = file_jobs.stored_path(source_id, message_id, filename)
         if cached:
             return _file_response(cached, filename)
+        # 远端消息 id 对不上本机缓存，不要先扫本地盘，否则会一直停在「正在查缓存」
+        try:
+            job = file_jobs.hub.request(source_id, message_id, session_id, filename)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if job.get("status") == "ready" and job.get("path") and os.path.isfile(job["path"]):
+            return _file_response(job["path"], filename or job.get("filename") or "")
+        if job.get("status") == "missing":
+            raise HTTPException(status_code=404, detail=job.get("detail") or "对方电脑未缓存该文件")
+        if job.get("status") == "error":
+            raise HTTPException(status_code=409, detail=job.get("detail") or "拉取失败")
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": job.get("status") or "pending",
+                "job_id": job.get("job_id") or "",
+                "detail": "正在等待远端助手回传文件",
+            },
+        )
     try:
         path = getter(int(message_id), filename_hint=filename)
     except TypeError:
         path = getter(int(message_id))
     if path and os.path.isfile(path):
         return _file_response(path, filename)
-    if source_id == "local":
-        raise HTTPException(status_code=404, detail="文件不在本机缓存，查看聊天时不会自动下载")
-    try:
-        job = file_jobs.hub.request(source_id, message_id, session_id, filename)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    if job.get("status") == "ready" and job.get("path") and os.path.isfile(job["path"]):
-        return _file_response(job["path"], filename or job.get("filename") or "")
-    if job.get("status") == "missing":
-        raise HTTPException(status_code=404, detail=job.get("detail") or "对方电脑未缓存该文件")
-    if job.get("status") == "error":
-        raise HTTPException(status_code=409, detail=job.get("detail") or "拉取失败")
-    return JSONResponse(
-        status_code=202,
-        content={
-            "status": job.get("status") or "pending",
-            "job_id": job.get("job_id") or "",
-            "detail": "正在等待远端助手回传文件",
-        },
-    )
+    raise HTTPException(status_code=404, detail="文件不在本机缓存，查看聊天时不会自动下载")
 
 
 @app.get("/api/media/proxy")

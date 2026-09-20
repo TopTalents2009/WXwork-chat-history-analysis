@@ -76,6 +76,7 @@ async function pollPresence() {
     const { data } = await chatApi.getPresence(lastAlertId.value)
     online.value = data.online || []
     const alerts = data.alerts || []
+    window.dispatchEvent(new CustomEvent('chatinsight-presence', { detail: { online: online.value, alerts } }))
     if (!primed) {
       primed = true
       if (alerts.length) lastAlertId.value = Math.max(...alerts.map((item) => item.id))
@@ -88,7 +89,6 @@ async function pollPresence() {
         desktopNotify(alert)
       }
     }
-    window.dispatchEvent(new CustomEvent('chatinsight-presence', { detail: { online: online.value, alerts } }))
   } catch (e) {
     console.error(e)
   }

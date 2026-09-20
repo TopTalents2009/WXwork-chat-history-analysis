@@ -109,7 +109,7 @@ def search_local(
     source_name: str = "本机",
 ) -> List[dict]:
     hits = []
-    sessions = platform.list_sessions(limit=200)
+    sessions = platform.list_sessions(limit=2000)
     msg_limit = 4000 if session_id else 1200
     for session in sessions:
         sid = session.username

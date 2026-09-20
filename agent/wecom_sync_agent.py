@@ -48,6 +48,8 @@ HEARTBEAT_INTERVAL_MS = 5 * 1000
 MAX_FILE_BYTES = 80 * 1024 * 1024
 MAX_AGENT_BYTES = 120 * 1024 * 1024
 UPDATE_RETRY_SEC = 30 * 60
+SYNC_BATCH_SIZE = 25
+MESSAGE_EXPORT_LIMIT = 0
 AUTOSTART_NAME = "WeComSyncAgent"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -191,6 +193,7 @@ def _load_settings() -> dict:
         "token": "",
         "auto_sync": True,
         "auto_sync_ids": [],
+        "seen_conversation_ids": [],
         "operator_name": "",
     }
     if os.path.exists(SETTINGS_FILE):
@@ -587,12 +590,38 @@ def split_conversations(rows: list):
     return groups, singles
 
 
-def sessions_for_auto_sync(conversations: list, checked_ids: list):
-    """Only sync explicitly checked chats. Nothing checked → nothing synced."""
+def sessions_for_auto_sync(conversations: list, checked_ids: list, seen_ids: list = None):
+    """Sync groups and direct chats.
+
+    Empty selection on a fresh install means everything. Newly seen chats are
+    included even if the previous checkbox list only had group chats.
+    """
     wanted = {str(cid) for cid in (checked_ids or []) if cid}
-    if not wanted:
-        return []
-    return [item for item in conversations if str(item.get("id") or "") in wanted]
+    seen = {str(cid) for cid in (seen_ids or []) if cid}
+    if not wanted and not seen:
+        return list(conversations or [])
+    selected = []
+    for item in conversations or []:
+        cid = str(item.get("id") or "")
+        if not cid:
+            continue
+        if cid in wanted or cid not in seen:
+            selected.append(item)
+    return selected
+
+
+def checked_ids_for_render(conversations: list, saved_ids: list, seen_ids: list = None):
+    """Default-check all chats, including newly appeared direct chats."""
+    saved = {str(cid) for cid in (saved_ids or []) if cid}
+    seen = {str(cid) for cid in (seen_ids or []) if cid}
+    checked = []
+    for item in conversations or []:
+        cid = str(item.get("id") or "")
+        if not cid:
+            continue
+        if cid in saved or cid not in seen:
+            checked.append(cid)
+    return checked
 
 
 def fetch_ingest_info(server_url: str, timeout: int = 8) -> dict:
@@ -629,10 +658,11 @@ def _post_json(server_url: str, path: str, payload: dict, token: str, timeout: i
         return json.loads(resp.read().decode("utf-8"))
 
 
-def send_heartbeat(server_url: str, token: str, operator_name: str = "") -> dict:
+def send_heartbeat(server_url: str, token: str, operator_name: str = "", status: str = "online") -> dict:
     payload = {
         "token": token,
         "agent_version": AGENT_VERSION,
+        "status": status or "online",
         **client_identity(operator_name),
     }
     return _post_json(server_url, "/api/ingest/heartbeat", payload, token, timeout=8)
@@ -751,29 +781,36 @@ def write_updater_script(pid: int, src: str, dest: str, extra_args: list) -> str
             handle,
             ensure_ascii=True,
         )
-    script = """$ErrorActionPreference = 'Stop'
+    script = r"""$ErrorActionPreference = 'Continue'
 $planPath = Join-Path $PSScriptRoot 'plan.json'
 $logPath = Join-Path $PSScriptRoot 'apply.log'
-try {
-  $plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
-  $waitPid = [int]$plan.pid
-  for ($i = 0; $i -lt 60; $i++) {
-    if (-not (Get-Process -Id $waitPid -ErrorAction SilentlyContinue)) { break }
-    Start-Sleep -Milliseconds 500
-  }
-  Get-Process WeComSyncAgent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-  Start-Sleep -Milliseconds 600
-  Copy-Item -LiteralPath $plan.src -Destination $plan.dst -Force
-  $argList = @()
-  if ($plan.args) { $argList = @($plan.args) }
-  if ($argList.Count -gt 0) {
-    Start-Process -FilePath $plan.dst -ArgumentList $argList
-  } else {
-    Start-Process -FilePath $plan.dst
-  }
-} catch {
-  $_ | Out-File -FilePath $logPath -Encoding utf8
+function Write-Log($m) {
+  "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Out-File -FilePath $logPath -Append -Encoding utf8
 }
+$plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
+$waitPid = [int]$plan.pid
+for ($i = 0; $i -lt 80; $i++) {
+  if (-not (Get-Process -Id $waitPid -ErrorAction SilentlyContinue)) { break }
+  Start-Sleep -Milliseconds 250
+}
+Get-Process WeComSyncAgent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+$copied = $false
+for ($i = 0; $i -lt 25; $i++) {
+  Start-Sleep -Milliseconds 400
+  try {
+    Copy-Item -LiteralPath $plan.src -Destination $plan.dst -Force
+    $copied = $true
+    break
+  } catch {
+    Write-Log $_
+  }
+}
+if (-not $copied) { Write-Log 'copy failed, launching existing exe' }
+$launch = $plan.dst
+if (-not (Test-Path -LiteralPath $launch)) { $launch = $plan.src }
+$argList = @('--background')
+Start-Process -FilePath $launch -ArgumentList $argList
+Write-Log "started $launch"
 """
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -924,7 +961,7 @@ def process_file_job(server_url: str, token: str, job: dict) -> str:
     return "ready"
 
 
-def export_messages(conversation_id: str, users: dict, limit: int = 3000, room_nicks: dict = None):
+def export_messages(conversation_id: str, users: dict, limit: int = MESSAGE_EXPORT_LIMIT, room_nicks: dict = None):
     conn = _open_db("message.db")
     if not conn:
         return []
@@ -935,10 +972,12 @@ def export_messages(conversation_id: str, users: dict, limit: int = 3000, room_n
             if not _table_exists(conn, table):
                 continue
             cols = [d[0] for d in conn.execute(f'SELECT * FROM "{table}" LIMIT 1').description]
-            rows = conn.execute(
-                f'SELECT * FROM "{table}" WHERE conversation_id = ? ORDER BY send_time DESC LIMIT ?',
-                (conversation_id, limit),
-            ).fetchall()
+            sql = f'SELECT * FROM "{table}" WHERE conversation_id = ? ORDER BY send_time DESC'
+            params = [conversation_id]
+            if limit and int(limit) > 0:
+                sql += " LIMIT ?"
+                params.append(int(limit))
+            rows = conn.execute(sql, tuple(params)).fetchall()
             for row in rows:
                 m = dict(zip(cols, row))
                 ts = m.get("send_time")
@@ -990,11 +1029,35 @@ def _account_id() -> str:
 
 
 def push_sessions(server_url: str, token: str, selected: list, users: dict, log, operator_name: str = "", room_nicks: dict = None):
-    sessions = []
-    for item in selected:
-        log(f"读取 {item['display_name']} ...")
+    identity = client_identity(operator_name)
+    last = {
+        "saved_sessions": 0,
+        "session_count": 0,
+        "computer_name": identity.get("computer_name") or "",
+    }
+    batch = []
+    total = len(selected or [])
+    saved_total = 0
+
+    def flush():
+        nonlocal last, batch, saved_total
+        if not batch:
+            return
+        payload = {
+            "token": token,
+            **identity,
+            "sessions": batch,
+        }
+        result = _post_json(server_url, "/api/ingest/wecom", payload, token, timeout=180)
+        saved_total += int((result or {}).get("saved_sessions") or 0)
+        last = dict(result or last)
+        last["saved_sessions"] = saved_total
+        batch = []
+
+    for index, item in enumerate(selected or [], 1):
+        log(f"读取 {item['display_name']}（{index}/{total}）...")
         messages = export_messages(item["id"], users, room_nicks=room_nicks or {})
-        sessions.append({
+        batch.append({
             "id": item["id"],
             "username": item["id"],
             "display_name": item["display_name"],
@@ -1003,12 +1066,10 @@ def push_sessions(server_url: str, token: str, selected: list, users: dict, log,
             "msg_count": len(messages) or item["msg_count"],
             "messages": messages,
         })
-    payload = {
-        "token": token,
-        **client_identity(operator_name),
-        "sessions": sessions,
-    }
-    return _post_json(server_url, "/api/ingest/wecom", payload, token, timeout=120)
+        if len(batch) >= SYNC_BATCH_SIZE:
+            flush()
+    flush()
+    return last
 
 
 class AgentApp:
@@ -1062,7 +1123,7 @@ class AgentApp:
         self.auto_var = tk.BooleanVar(value=bool(self.settings.get("auto_sync", True)))
         ttk.Checkbutton(
             auto_row,
-            text="每 5 分钟自动解密并同步到服务器",
+            text="每 5 分钟自动解密并同步全部群聊和单聊",
             variable=self.auto_var,
             command=self._on_auto_toggle,
         ).pack(side=tk.LEFT)
@@ -1086,8 +1147,9 @@ class AgentApp:
         self.decrypt_btn.pack(side=tk.LEFT)
         self.sync_btn = ttk.Button(btns, text="2. 同步所选会话到服务器", command=self.start_sync)
         self.sync_btn.pack(side=tk.LEFT, padx=8)
-        ttk.Button(btns, text="全选群聊", command=lambda: self._set_kind(True, True)).pack(side=tk.LEFT)
-        ttk.Button(btns, text="全选单聊", command=lambda: self._set_kind(False, True)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="全选", command=lambda: self._set_all(True)).pack(side=tk.LEFT)
+        ttk.Button(btns, text="全选群聊", command=lambda: self._set_kind(True, True)).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="全选单聊", command=lambda: self._set_kind(False, True)).pack(side=tk.LEFT)
         ttk.Button(btns, text="全不选", command=lambda: self._set_all(False)).pack(side=tk.LEFT, padx=4)
         ttk.Button(btns, text="退出应用", command=self.quit_app).pack(side=tk.RIGHT)
         ttk.Button(btns, text="更新说明", command=self.show_update_notes).pack(side=tk.RIGHT, padx=4)
@@ -1110,21 +1172,18 @@ class AgentApp:
         self.log_box.pack(fill=tk.X)
         ttk.Button(frm, text="完成", command=self.complete_and_hide).pack(anchor="e", pady=(8, 0))
 
-        self.log("请保持企业微信已登录。解密后勾选会话，点「完成」转入后台静默运行。")
+        self.log("请保持企业微信已登录。默认同步全部群聊和单聊，点「完成」转入后台静默运行。")
         self.log(f"助手版本 {AGENT_VERSION}，服务器地址已默认填写：{self.server_var.get()}")
         self.root.protocol("WM_DELETE_WINDOW", self.complete_and_hide)
         self.root.after(800, self._poll_show_flag)
         self.root.after(200, self.fetch_token)
+        self.root.after(800, self._ensure_heartbeat)
+        self.root.after(2500, self._ensure_auto_sync)
         if os.path.isdir(DECRYPTED_DIR) and os.path.exists(os.path.join(DECRYPTED_DIR, "message.db")):
             self.log("发现已有解密数据，正在加载会话列表...")
             self.root.after(200, self.reload_conversations)
         if self._hidden:
             self.root.after(400, self._maybe_show_update_notice)
-            if looks_like_real_name(self._operator_name()):
-                self.root.after(1500, self._heartbeat_tick)
-            if self.auto_var.get() and looks_like_real_name(self._operator_name()):
-                self.log("已开启每 5 分钟自动同步；请先勾选要同步的会话。")
-                self._schedule_auto(8000)
         else:
             self.root.after(400, self._startup_visible)
 
@@ -1246,6 +1305,10 @@ class AgentApp:
     def _prompt_real_name(self):
         if self._hidden:
             return
+        if looks_like_real_name(self._operator_name()):
+            self._ensure_heartbeat()
+            self._ensure_auto_sync()
+            return
         try:
             self.root.deiconify()
             self.root.lift()
@@ -1285,9 +1348,7 @@ class AgentApp:
             self.name_entry.focus_set()
             if self._hb_job is None:
                 self._heartbeat_tick()
-            if self.auto_var.get() and self._auto_job is None:
-                self.log("已开启每 5 分钟自动同步；请先勾选要同步的会话。")
-                self._schedule_auto(8000)
+            self._ensure_auto_sync()
             return
 
     def complete_and_hide(self):
@@ -1364,12 +1425,19 @@ class AgentApp:
         return looks_like_real_name(self._operator_name())
 
     def _persist_settings(self):
+        seen = {str(cid) for cid in (self.settings.get("seen_conversation_ids") or []) if cid}
+        seen.update(str(item["id"]) for item in self.conversations if item.get("id"))
+        if self.var_by_id:
+            auto_sync_ids = self._checked_ids()
+        else:
+            auto_sync_ids = list(self.settings.get("auto_sync_ids") or [])
         data = {
             "server_url": self.server_var.get().strip() or DEFAULT_SERVER_URL,
             "token": self.token_var.get().strip(),
             "operator_name": self._operator_name(),
             "auto_sync": bool(self.auto_var.get()),
-            "auto_sync_ids": self._checked_ids(),
+            "auto_sync_ids": auto_sync_ids,
+            "seen_conversation_ids": sorted(seen),
             "setup_done": bool(self.settings.get("setup_done")),
             "last_seen_version": str(self.settings.get("last_seen_version") or ""),
         }
@@ -1379,7 +1447,7 @@ class AgentApp:
     def _on_auto_toggle(self):
         self._persist_settings()
         if self.auto_var.get():
-            self.log("已开启每 5 分钟自动同步")
+            self.log("已开启每 5 分钟自动同步，将上传全部群聊和单聊")
             self.status_var.set("约 8 秒后开始自动同步")
             self._schedule_auto(8000)
         else:
@@ -1400,6 +1468,17 @@ class AgentApp:
     def _heartbeat_tick(self):
         self._heartbeat_now()
         self._hb_job = self.root.after(HEARTBEAT_INTERVAL_MS, self._heartbeat_tick)
+
+    def _ensure_heartbeat(self):
+        if self._hb_job is not None:
+            return
+        self._heartbeat_tick()
+
+    def _ensure_auto_sync(self):
+        if not self.auto_var.get() or self._auto_job is not None or self._busy:
+            return
+        self.log("已开启自动解密并同步全部群聊和单聊")
+        self._schedule_auto(3000)
 
     def _heartbeat_now(self):
         server = self.server_var.get().strip()
@@ -1459,8 +1538,12 @@ class AgentApp:
                 int(info.get("size") or 0),
                 str(info.get("sha256") or ""),
             )
-            extra = ["--background"] if ("--background" in sys.argv or self._hidden) else []
+            extra = ["--background"]
             save_pending_update(info)
+            try:
+                send_heartbeat(server, token, self._operator_name(), status="updating")
+            except Exception:
+                pass
             apply_downloaded_update(new_path, app_executable(), extra)
             self.root.after(0, lambda: self.log(
                 f"新版本 {info.get('version')} 已就绪，正在重启助手"
@@ -1535,21 +1618,18 @@ class AgentApp:
             return
         server = self.server_var.get().strip()
         token = self.token_var.get().strip()
-        checked = self._checked_ids()
-        if not checked:
-            self.log("尚未勾选会话，跳过本轮自动同步")
-            self._schedule_auto()
-            return
+        checked = self._checked_ids() or list(self.settings.get("auto_sync_ids") or [])
+        seen = list(self.settings.get("seen_conversation_ids") or [])
         self._busy = True
         self.decrypt_btn.state(["disabled"])
         self.sync_btn.state(["disabled"])
         threading.Thread(
             target=self._auto_worker,
-            args=(server, token, checked, self._operator_name()),
+            args=(server, token, checked, seen, self._operator_name()),
             daemon=True,
         ).start()
 
-    def _auto_worker(self, server, token, checked_ids, operator_name=""):
+    def _auto_worker(self, server, token, checked_ids, seen_ids=None, operator_name=""):
         try:
             if not server:
                 raise RuntimeError("未填写服务器地址")
@@ -1569,11 +1649,14 @@ class AgentApp:
                 self.root.after(0, lambda: self.log("自动同步：企业微信未运行，跳过解密，同步已有数据"))
 
             conversations, users, room_nicks = list_conversations()
-            selected = sessions_for_auto_sync(conversations, checked_ids)
+            selected = sessions_for_auto_sync(conversations, checked_ids, seen_ids)
             if not selected:
-                self.root.after(0, lambda: self.log("自动同步：勾选的会话当前没有消息，已跳过"))
+                self.root.after(0, lambda: self.log("自动同步：当前没有可上传的聊天记录，已跳过"))
                 return
-            self.root.after(0, lambda: self.log(f"自动同步：解析并上传 {len(selected)} 个勾选会话"))
+            groups, singles = split_conversations(selected)
+            self.root.after(0, lambda: self.log(
+                f"自动同步：解析并上传 {len(selected)} 个会话（群聊 {len(groups)}，单聊 {len(singles)}）"
+            ))
             result = push_sessions(
                 server, token, selected, users,
                 lambda m: self.root.after(0, lambda msg=m: self.log(msg)),
@@ -1617,22 +1700,32 @@ class AgentApp:
             var = tk.BooleanVar(value=str(item["id"]) in saved)
             self.var_by_id[item["id"]] = var
             label = f"{item['display_name']}    {item['msg_count']}条    {item['last_time']}"
-            ttk.Checkbutton(box, text=label, variable=var).pack(anchor="w", padx=8)
+            ttk.Checkbutton(
+                box,
+                text=label,
+                variable=var,
+                command=self._persist_settings,
+            ).pack(anchor="w", padx=8)
 
     def _render_list(self):
-        saved = {str(cid) for cid in (self.settings.get("auto_sync_ids") or [])}
+        checked = set(checked_ids_for_render(
+            self.conversations,
+            self.settings.get("auto_sync_ids") or [],
+            self.settings.get("seen_conversation_ids") or [],
+        ))
         for child in self.list_frame.winfo_children():
             child.destroy()
         self.var_by_id = {}
         groups, singles = split_conversations(self.conversations)
-        self._add_section("群聊", groups, saved)
-        self._add_section("单聊", singles, saved)
+        self._add_section("群聊", groups, checked)
+        self._add_section("单聊", singles, checked)
 
     def reload_conversations(self):
         try:
             self.conversations, self.users, self.room_nicks = list_conversations()
             groups, singles = split_conversations(self.conversations)
             self._render_list()
+            self._persist_settings()
             self.log(f"共 {len(self.conversations)} 个有消息的会话：群聊 {len(groups)}，单聊 {len(singles)}")
         except Exception as exc:
             self.log(f"加载会话失败: {exc}")

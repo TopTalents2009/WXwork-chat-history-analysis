@@ -177,7 +177,7 @@ GET /v1/sources/{source_id}/sessions
 
 | 参数 | 位置 | 默认 | 说明 |
 |------|------|------|------|
-| `limit` | query | 200 | 1–1000 |
+| `limit` | query | 1000 | 1–5000 |
 
 ```bash
 curl -H "X-API-Key: YOUR_KEY" "BASE/v1/sources/DESKTOP-ABC-123/sessions?limit=50"
