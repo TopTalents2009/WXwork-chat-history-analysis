@@ -8,7 +8,7 @@ from typing import Callable, Optional
 
 
 ONLINE_TTL_SEC = 90
-UPDATING_TTL_SEC = 15 * 60
+UPDATING_TTL_SEC = 3 * 60
 MAX_ALERTS = 50
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -109,6 +109,7 @@ class PresenceHub:
         computer_name: str = "",
         host: str = "",
         status: str = "online",
+        agent_version: str = "",
     ) -> dict:
         source_id = str(source_id or "").strip() or "pc"
         who = display_who(operator_name, computer_name)
@@ -123,6 +124,7 @@ class PresenceHub:
                 now,
                 prev.get("status") or "",
             )
+            version = (agent_version or "").strip() or ((prev or {}).get("agent_version") or "")
             self._clients[source_id] = {
                 "source_id": source_id,
                 "operator_name": (operator_name or "").strip(),
@@ -130,6 +132,7 @@ class PresenceHub:
                 "host": (host or "").strip(),
                 "last_seen": now.strftime(TIME_FMT),
                 "status": status,
+                "agent_version": version,
             }
             alert = None
             if not was_online:

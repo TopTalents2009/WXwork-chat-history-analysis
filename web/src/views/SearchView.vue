@@ -27,6 +27,8 @@
       <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
     </div>
 
+    <div v-else-if="errorText" class="py-16 text-center text-amber-700">{{ errorText }}</div>
+
     <div v-else-if="searched && !hits.length" class="py-16 text-center text-slate-400">
       没有匹配的消息
     </div>
@@ -38,12 +40,12 @@
         class="px-6 py-4 border-b border-slate-100 last:border-b-0 hover:bg-slate-50 cursor-pointer"
         @click="openHit(hit)"
       >
-        <div class="flex items-center gap-2 text-xs text-slate-400 mb-1">
-          <span class="text-slate-600 font-medium">{{ hit.session_name }}</span>
-          <span v-if="hit.source_name">· {{ hit.source_name }}</span>
+        <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-400 mb-1">
+          <span class="text-slate-600 font-medium break-words">{{ hit.session_name }}</span>
+          <span v-if="hit.source_name" class="break-words">· {{ hit.source_name }}</span>
           <span class="ml-auto">{{ hit.time_text }}</span>
         </div>
-        <div class="text-sm text-slate-900">
+        <div class="text-sm text-slate-900 break-words">
           <span class="font-medium">{{ hit.sender || '未知' }}：</span>
           <span>{{ hit.snippet || hit.text || hit.attachment_name }}</span>
         </div>
@@ -55,7 +57,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { chatApi, type SearchHit } from '../api'
+import { apiErrorMessage, chatApi, type SearchHit } from '../api'
 
 const route = useRoute()
 const router = useRouter()
@@ -63,6 +65,7 @@ const query = ref('')
 const hits = ref<SearchHit[]>([])
 const loading = ref(false)
 const searched = ref(false)
+const errorText = ref('')
 
 const sourceId = computed(() => String(route.query.source_id || ''))
 const sessionId = computed(() => String(route.query.session_id || ''))
@@ -92,6 +95,7 @@ async function runSearch() {
   if (!q) return
   loading.value = true
   searched.value = true
+  errorText.value = ''
   router.replace({
     name: 'search',
     query: {
@@ -111,6 +115,7 @@ async function runSearch() {
   } catch (e) {
     console.error(e)
     hits.value = []
+    errorText.value = apiErrorMessage(e, '搜索失败')
   } finally {
     loading.value = false
   }
@@ -123,6 +128,7 @@ function openHit(hit: SearchHit) {
       sourceId: hit.source_id,
       sessionId: hit.session_id,
     },
+    query: { name: hit.session_name || hit.session_id },
   })
 }
 </script>

@@ -24,8 +24,11 @@ class WeComDetectTests(unittest.TestCase):
         self.decrypted = os.path.join(self.root, "wxwork_decrypted")
         self.live_patch = patch.object(wecom, "load_live_manifest", return_value=None)
         self.live_patch.start()
+        self.agent_patch = patch.object(wecom, "_agent_decrypted_dir", return_value="")
+        self.agent_patch.start()
 
     def tearDown(self):
+        self.agent_patch.stop()
         self.live_patch.stop()
         self.tmp.cleanup()
 
@@ -47,6 +50,24 @@ class WeComDetectTests(unittest.TestCase):
             self.assertEqual(plat.detect_data_dir(), self.account_data)
             self.assertEqual(plat.data_dir, self.account_data)
 
+    def test_detect_data_dir_prefers_newer_agent_decrypt(self):
+        os.makedirs(self.decrypted)
+        with open(os.path.join(self.decrypted, "message.db"), "wb") as f:
+            f.write(b"SQLite format 3\x00")
+        os.utime(os.path.join(self.decrypted, "message.db"), (10, 10))
+        agent_dir = os.path.join(self.root, "agent_decrypted")
+        os.makedirs(agent_dir)
+        agent_db = os.path.join(agent_dir, "message.db")
+        with open(agent_db, "wb") as f:
+            f.write(b"SQLite format 3\x00")
+        os.utime(agent_db, (100, 100))
+        with patch.object(wecom, "_get_wxwork_base_dirs", return_value=[self.wxwork]), \
+             patch.object(wecom, "DECRYPTED_DIR", self.decrypted), \
+             patch.object(wecom, "_agent_decrypted_dir", return_value=agent_dir):
+            plat = wecom.WeComPlatform()
+            self.assertEqual(plat.detect_data_dir(), agent_dir)
+            self.assertEqual(plat._decrypted_dir, agent_dir)
+
     def test_detect_data_dir_prefers_plaintext_decrypted_dir(self):
         os.makedirs(self.decrypted)
         with open(os.path.join(self.decrypted, "message.db"), "wb") as f:
@@ -67,6 +88,15 @@ class WeComDetectTests(unittest.TestCase):
              patch.object(wecom, "DECRYPTED_DIR", self.decrypted):
             plat = wecom.WeComPlatform()
             self.assertEqual(plat.detect_data_dir(), self.account_data)
+
+    def test_infer_self_id_counts_self_chat_once(self):
+        self_id = 1688855370846072
+        cids = [
+            "S:%s_1688858081684753" % self_id,
+            "S:%s_1688850157563691" % self_id,
+            "S:%s_%s" % (self_id, self_id),
+        ]
+        self.assertEqual(wecom._infer_self_user_id(cids), self_id)
 
     def test_append_wxwork_base_includes_nested_wxwork(self):
         parent = os.path.join(self.root, "chat_records")

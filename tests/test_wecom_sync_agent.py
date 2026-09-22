@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -250,6 +251,10 @@ class WecomSyncAgentTests(unittest.TestCase):
             self.assertIn("Copy-Item", text)
             self.assertIn("--background", text)
             self.assertIn("Start-Process", text)
+            self.assertIn("Stop-Process", text)
+            self.assertIn("agent.lock", text)
+            self.assertIn("copy failed", text)
+            self.assertNotIn("launching existing exe", text)
             plan = os.path.join(tmp, "update", "plan.json")
             with open(plan, encoding="utf-8") as f:
                 data = json.load(f)
@@ -270,6 +275,110 @@ class WecomSyncAgentTests(unittest.TestCase):
     def test_existing_install_without_seen_version(self):
         self.assertTrue(agent.looks_like_existing_install({"setup_done": True}))
         self.assertFalse(agent.looks_like_existing_install({}))
+
+    def test_incremental_export_skips_synced_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_dir = os.path.join(tmp, "wxwork_decrypted")
+            os.makedirs(db_dir)
+            db_path = os.path.join(db_dir, "message.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE message_table ("
+                "message_id INTEGER, conversation_id TEXT, send_time INTEGER, "
+                "sender_id INTEGER, content_type INTEGER, content TEXT, "
+                "extra_content TEXT, local_extra_content TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO message_table VALUES (?, ?, ?, 1, 2, ?, '', '')",
+                [
+                    (1, "R:1", 1700000000, "old"),
+                    (2, "R:1", 1700000060, "new"),
+                    (3, "R:2", 1700000120, "other"),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            with mock.patch.object(agent, "DECRYPTED_DIR", db_dir):
+                first, pending = agent.export_incremental(["R:1", "R:2"], {}, {})
+                self.assertEqual([m["message_id"] for m in first["R:1"]], [1, 2])
+                self.assertEqual(pending["R:1"]["message_table"], 2)
+                cursors = {"R:1": {"message_table": 1}, "R:2": {"message_table": 3}}
+                second, pending2 = agent.export_incremental(["R:1", "R:2"], {}, {}, cursors)
+            self.assertEqual(list(second), ["R:1"])
+            self.assertEqual([m["text"] for m in second["R:1"]], ["new"])
+            self.assertEqual(pending2["R:1"]["message_table"], 2)
+            self.assertNotIn("R:2", pending2)
+
+    def test_push_advances_cursor_only_after_upload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_dir = os.path.join(tmp, "wxwork_decrypted")
+            os.makedirs(db_dir)
+            conn = sqlite3.connect(os.path.join(db_dir, "message.db"))
+            conn.execute(
+                "CREATE TABLE message_table ("
+                "message_id INTEGER, conversation_id TEXT, send_time INTEGER, "
+                "sender_id INTEGER, content_type INTEGER, content TEXT, "
+                "extra_content TEXT, local_extra_content TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO message_table VALUES (7, 'R:1', 1700000000, 1, 2, 'hi', '', '')"
+            )
+            conn.commit()
+            conn.close()
+            settings = os.path.join(tmp, "settings.json")
+            cursors = {}
+            with mock.patch.object(agent, "DECRYPTED_DIR", db_dir), \
+                    mock.patch.object(agent, "SETTINGS_FILE", settings), \
+                    mock.patch.object(agent, "_post_json", side_effect=RuntimeError("down")):
+                with self.assertRaises(RuntimeError):
+                    agent.push_sessions(
+                        "http://127.0.0.1:8767", "tok",
+                        [{"id": "R:1", "display_name": "家", "session_type": 2, "last_time": "", "msg_count": 1}],
+                        {}, lambda _msg: None, cursors=cursors,
+                    )
+            self.assertEqual(cursors, {})
+            with mock.patch.object(agent, "DECRYPTED_DIR", db_dir), \
+                    mock.patch.object(agent, "SETTINGS_FILE", settings), \
+                    mock.patch.object(agent, "_post_json", return_value={"saved_sessions": 1}):
+                result = agent.push_sessions(
+                    "http://127.0.0.1:8767", "tok",
+                    [{"id": "R:1", "display_name": "家", "session_type": 2, "last_time": "", "msg_count": 1}],
+                    {}, lambda _msg: None, cursors=cursors,
+                )
+            self.assertEqual(result["new_messages"], 1)
+            self.assertEqual(cursors["R:1"]["message_table"], 7)
+            with mock.patch.object(agent, "DECRYPTED_DIR", db_dir), \
+                    mock.patch.object(agent, "SETTINGS_FILE", settings), \
+                    mock.patch.object(agent, "_post_json", return_value={"saved_sessions": 1}) as post:
+                again = agent.push_sessions(
+                    "http://127.0.0.1:8767", "tok",
+                    [{"id": "R:1", "display_name": "家", "session_type": 2, "last_time": "", "msg_count": 1}],
+                    {}, lambda _msg: None, cursors=cursors,
+                )
+            post.assert_not_called()
+            self.assertEqual(again["new_messages"], 0)
+
+    def test_decrypt_failure_message_includes_tool_output(self):
+        msg = agent.decrypt_failure_message(
+            "提取密钥失败",
+            ["[+] scanning", "[!] 未能自动检测企业微信数据目录"],
+            1,
+        )
+        self.assertIn("退出码 1", msg)
+        self.assertIn("未能自动检测企业微信数据目录", msg)
+
+    def test_guard_systemexit_converts_nonzero(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            agent._guard_systemexit(
+                lambda: (_ for _ in ()).throw(SystemExit(1)),
+                "提取密钥失败",
+                ["未能自动检测企业微信数据目录"],
+            )
+        self.assertIn("提取密钥失败", str(ctx.exception))
+        self.assertIn("未能自动检测", str(ctx.exception))
+
+    def test_guard_systemexit_zero_is_ok(self):
+        self.assertIsNone(agent._guard_systemexit(lambda: (_ for _ in ()).throw(SystemExit(0)), "x"))
 
 
 if __name__ == "__main__":

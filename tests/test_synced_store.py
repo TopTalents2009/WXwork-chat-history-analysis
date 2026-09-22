@@ -123,6 +123,37 @@ class SyncedStoreTests(unittest.TestCase):
         sessions = synced_store.list_sessions(result["source_id"])
         self.assertEqual(sessions[0]["display_name"], "家")
 
+    def test_filter_messages_by_date(self):
+        rows = [
+            {"time_text": "2026-09-14 09:46", "text": "old"},
+            {"time_text": "2026-09-22 09:22", "text": "new"},
+            {"time_text": "09:22", "text": "nodate"},
+        ]
+        kept = synced_store.filter_messages_by_date(rows, "2026-09-22", "2026-09-22")
+        self.assertEqual([item["text"] for item in kept], ["new"])
+
+    def test_message_cursors_use_highest_id(self):
+        result = synced_store.save_ingest({
+            "computer_name": "PC-C",
+            "sessions": [{
+                "id": "S:1",
+                "display_name": "张三",
+                "messages": [
+                    {"message_id": 4, "text": "old", "time_text": "2026-09-22 08:30"},
+                    {"message_id": 9, "text": "new", "time_text": "2026-09-22 09:22"},
+                ],
+            }],
+        })
+        synced_store.save_ingest({
+            "computer_name": "PC-C",
+            "sessions": [{
+                "id": "S:1",
+                "display_name": "张三",
+                "messages": [{"message_id": 10, "text": "later", "time_text": "2026-09-22 10:00"}],
+            }],
+        })
+        self.assertEqual(synced_store.message_cursors(result["source_id"]), {"S:1": 10})
+
     def test_merge_keeps_old_messages(self):
         first = synced_store.save_ingest({
             "computer_name": "PC-M",

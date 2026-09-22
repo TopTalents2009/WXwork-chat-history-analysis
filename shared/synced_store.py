@@ -44,6 +44,26 @@ def _message_key(item: dict) -> str:
     return f"t:{item.get('time_text') or ''}|{item.get('sender') or ''}|{text}"
 
 
+def max_message_id(messages: list) -> int:
+    best = 0
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            best = max(best, int(item.get("message_id") or 0))
+        except (TypeError, ValueError):
+            continue
+    return best
+
+
+def _session_sort_key(item: dict):
+    return (
+        str(item.get("last_time") or ""),
+        str(item.get("synced_at") or ""),
+        int(item.get("sync_seq") or 0),
+    )
+
+
 def merge_messages(old: list, new: list) -> list:
     """Keep the union of old and new messages; the latest payload wins on id clash."""
     by_key = {}
@@ -149,14 +169,12 @@ def save_ingest(payload: dict) -> dict:
             "summary": item.get("summary") or "",
             "synced_at": now,
             "sync_seq": sync_seq,
+            "max_message_id": max_message_id(messages),
         }
         saved += 1
 
     sessions = list(existing_sessions.values())
-    sessions.sort(
-        key=lambda s: (int(s.get("sync_seq") or 0), s.get("synced_at") or "", s.get("last_time") or ""),
-        reverse=True,
-    )
+    sessions.sort(key=_session_sort_key, reverse=True)
     _write_json(os.path.join(folder, "sessions.json"), sessions)
 
     meta = {
@@ -193,13 +211,57 @@ def get_source(source_id: str) -> Optional[dict]:
     return meta
 
 
+def message_cursors(source_id: str) -> dict:
+    """Highest stored message id per conversation, used as the incremental sync baseline."""
+    folder = _source_dir(source_id)
+    path = os.path.join(folder, "sessions.json")
+    sessions = _read_json(path, [])
+    if not isinstance(sessions, list):
+        return {}
+    changed = False
+    cursors = {}
+    for item in sessions:
+        if not isinstance(item, dict) or not item.get("username"):
+            continue
+        sid = str(item["username"])
+        if item.get("max_message_id") is None:
+            messages = _read_json(os.path.join(folder, "messages", _safe_id(sid) + ".json"), [])
+            item["max_message_id"] = max_message_id(messages if isinstance(messages, list) else [])
+            changed = True
+        try:
+            cursors[sid] = int(item.get("max_message_id") or 0)
+        except (TypeError, ValueError):
+            cursors[sid] = 0
+    if changed:
+        _write_json(path, sessions)
+    return cursors
+
+
 def list_sessions(source_id: str) -> List[dict]:
     sessions = _read_json(os.path.join(_source_dir(source_id), "sessions.json"), [])
-    sessions.sort(
-        key=lambda s: (int(s.get("sync_seq") or 0), s.get("synced_at") or "", s.get("last_time") or ""),
-        reverse=True,
-    )
+    sessions.sort(key=_session_sort_key, reverse=True)
     return sessions
+
+
+def filter_messages_by_date(messages: list, start_date: str = "", end_date: str = "") -> list:
+    """Keep messages whose time_text date falls in [start_date, end_date]."""
+    start_date = (start_date or "").strip()
+    end_date = (end_date or "").strip()
+    if not start_date and not end_date:
+        return list(messages or [])
+    kept = []
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        day = str(item.get("time_text") or "")[:10]
+        if len(day) != 10 or day[4] != "-":
+            continue
+        if start_date and day < start_date:
+            continue
+        if end_date and day > end_date:
+            continue
+        kept.append(item)
+    return kept
 
 
 def list_messages(source_id: str, session_id: str, limit: int = 1000) -> List[dict]:

@@ -1,15 +1,18 @@
 <template>
   <div class="flex flex-col h-[calc(100vh-5rem)]">
-    <div class="flex items-center justify-between mb-4">
-      <div class="flex items-center gap-3">
-        <router-link to="/" class="text-slate-400 hover:text-slate-600 transition-colors">
+    <div class="flex flex-col gap-3 mb-4">
+      <div class="flex items-start gap-3 min-w-0">
+        <router-link to="/" class="text-slate-400 hover:text-slate-600 transition-colors mt-1">
           <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
           </svg>
         </router-link>
-        <h1 class="text-xl font-semibold text-slate-900">{{ sessionId }}</h1>
+        <div class="min-w-0 flex-1">
+          <h1 class="text-xl font-semibold text-slate-900 break-words">{{ sessionTitle }}</h1>
+          <p v-if="sessionTitle !== sessionId" class="text-xs text-slate-400 break-all">{{ sessionId }}</p>
+        </div>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
         <input
           v-model="keyword"
           type="search"
@@ -35,7 +38,7 @@
           查询
         </button>
         <router-link
-          :to="{ name: 'stats', params: { sourceId, sessionId } }"
+          :to="{ name: 'stats', params: { sourceId, sessionId }, query: route.query }"
           class="text-sm bg-slate-100 text-slate-700 px-4 py-1.5 rounded-lg hover:bg-slate-200 transition-colors"
         >
           统计
@@ -43,13 +46,24 @@
       </div>
     </div>
 
-    <div class="flex-1 overflow-y-auto bg-white rounded-2xl border border-slate-200 p-4 space-y-3">
+    <div
+      v-if="loadError"
+      class="mb-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 flex items-center justify-between gap-3"
+    >
+      <span>{{ loadError }}</span>
+      <button type="button" class="shrink-0 underline" @click="loadMessages">重试</button>
+    </div>
+
+    <div
+      ref="listEl"
+      class="flex-1 min-h-0 overflow-y-auto bg-white rounded-2xl border border-slate-200 p-4 space-y-3"
+    >
       <div v-if="loading" class="flex items-center justify-center py-10">
         <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary-600"></div>
       </div>
 
       <div v-else-if="!messages.length" class="flex items-center justify-center py-10 text-slate-400">
-        暂无消息
+        {{ loadError ? '消息没有加载出来' : '暂无消息' }}
       </div>
 
       <div
@@ -93,7 +107,7 @@
               {{ fileExt(fileName(msg)) }}
             </div>
             <div class="min-w-0 flex-1">
-              <div class="text-sm font-medium text-slate-900 truncate">{{ fileName(msg) || '聊天文件' }}</div>
+              <div class="text-sm font-medium text-slate-900 break-all">{{ fileName(msg) || '聊天文件' }}</div>
               <div class="text-xs text-slate-400">{{ fileStatusText(msg) }}</div>
             </div>
             <button
@@ -107,6 +121,7 @@
           </div>
         </div>
       </div>
+      <div ref="endEl"></div>
     </div>
 
     <Teleport to="body">
@@ -128,9 +143,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, nextTick, ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { chatApi, type Message } from '../api'
+import { apiErrorMessage, chatApi, type Message } from '../api'
 
 const route = useRoute()
 const router = useRouter()
@@ -139,7 +154,11 @@ const sourceId = route.params.sourceId as string
 const sessionId = route.params.sessionId as string
 
 const messages = ref<Message[]>([])
+const listEl = ref<HTMLElement | null>(null)
+const endEl = ref<HTMLElement | null>(null)
 const loading = ref(true)
+const loadError = ref('')
+const sessionTitle = computed(() => String(route.query.name || sessionId))
 const startDate = ref('')
 const endDate = ref('')
 const keyword = ref('')
@@ -326,8 +345,23 @@ async function downloadFile(msg: Message) {
   }
 }
 
+function chronological(rows: Message[]) {
+  return [...rows].sort((a, b) => {
+    const byTime = (a.time_text || '').localeCompare(b.time_text || '')
+    if (byTime) return byTime
+    return (a.message_id || 0) - (b.message_id || 0)
+  })
+}
+
+function scrollToLatest() {
+  const el = listEl.value
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+}
+
 async function loadMessages() {
   loading.value = true
+  loadError.value = ''
   imgFallback.value = {}
   previewUrl.value = ''
   downloadState.value = {}
@@ -336,12 +370,18 @@ async function loadMessages() {
     if (startDate.value) params.start_date = startDate.value
     if (endDate.value) params.end_date = endDate.value
     const { data } = await chatApi.getSourceMessages(sourceId, sessionId, params)
-    messages.value = data.reverse()
+    messages.value = chronological(data)
   } catch (e) {
     console.error('Failed to load messages:', e)
+    messages.value = []
+    loadError.value = apiErrorMessage(e, '消息加载失败')
   } finally {
     loading.value = false
   }
+  await nextTick()
+  endEl.value?.scrollIntoView({ block: 'end' })
+  scrollToLatest()
+  requestAnimationFrame(scrollToLatest)
 }
 
 function searchInSession() {

@@ -32,6 +32,69 @@ ATTACHMENT_CONTENT_TYPES = _attach_mod.IMAGE_CONTENT_TYPES | _attach_mod.FILE_CO
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DECRYPTED_DIR = os.path.join(_PROJECT_ROOT, "export", "wxwork_decrypted")
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def _agent_decrypted_dir() -> str:
+    """Decrypted copy maintained by the sync agent on this PC."""
+    appdata = os.environ.get("APPDATA") or ""
+    if not appdata:
+        return ""
+    return os.path.join(appdata, "WeComSyncAgent", "wxwork_decrypted")
+
+
+def _has_plain_message_db(folder: str) -> bool:
+    if not folder:
+        return False
+    path = os.path.join(folder, "message.db")
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(16) == _SQLITE_HEADER
+    except OSError:
+        return False
+
+
+def _infer_self_user_id(conversation_ids) -> Optional[int]:
+    """The account that appears in every direct chat is the local user.
+
+    A chat with yourself is stored as S:<id>_<id>. Count that id once, or it
+    looks more common than the number of chats and the match fails.
+    """
+    counts = {}
+    session_n = 0
+    for cid in conversation_ids or []:
+        text = str(cid or "")
+        if not text.startswith("S:"):
+            continue
+        ids = [int(part) for part in text[2:].split("_") if part.isdigit()]
+        if len(ids) < 2:
+            continue
+        session_n += 1
+        for uid in set(ids):
+            counts[uid] = counts.get(uid, 0) + 1
+    for uid, count in sorted(counts.items(), key=lambda item: item[1], reverse=True):
+        if session_n >= 2 and count == session_n:
+            return uid
+    return None
+
+
+def _newest_local_decrypted_dir() -> Optional[str]:
+    """Pick the decrypted folder whose message.db was written most recently."""
+    best = ""
+    best_mtime = -1.0
+    for folder in (DECRYPTED_DIR, _agent_decrypted_dir()):
+        if not _has_plain_message_db(folder):
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(folder, "message.db"))
+        except OSError:
+            continue
+        if mtime > best_mtime:
+            best = folder
+            best_mtime = mtime
+    return best or None
 
 
 def _append_wxwork_base(path: str, bases: list) -> None:
@@ -136,6 +199,7 @@ class WeComPlatform(BasePlatform):
         self._account_roots = None
         self._attachment_resolver = None
         self._live = False
+        self._conn_mtime = {}
         if self.data_dir is None:
             self.data_dir = self.detect_data_dir()
         live = load_live_manifest()
@@ -143,23 +207,23 @@ class WeComPlatform(BasePlatform):
             self._live = os.path.normcase(self.data_dir) == os.path.normcase(
                 live.get("decrypted_dir") or ""
             )
+        if not self._live and _has_plain_message_db(self.data_dir or ""):
+            self._decrypted_dir = self.data_dir
 
     def detect_data_dir(self) -> Optional[str]:
         """Auto-detect WeCom data directory.
 
-        Prefer a live SSH session (data stays on the remote PC), then a local
-        decrypted directory, then the original encrypted WeCom data directory.
+        Prefer a live SSH session (data stays on the remote PC), then the
+        newest local decrypted database, then the original encrypted directory.
+        The sync agent keeps a fresher copy than export/wxwork_decrypted.
         """
         live = load_live_manifest()
         if live and live.get("decrypted_dir"):
             return live["decrypted_dir"]
 
-        if os.path.isdir(self._decrypted_dir):
-            msg_db = os.path.join(self._decrypted_dir, "message.db")
-            if os.path.exists(msg_db):
-                with open(msg_db, "rb") as f:
-                    if f.read(16) == b"SQLite format 3\x00":
-                        return self._decrypted_dir
+        decrypted = _newest_local_decrypted_dir()
+        if decrypted:
+            return decrypted
 
         return _latest_wxwork_data_dir()
 
@@ -232,9 +296,9 @@ class WeComPlatform(BasePlatform):
         return ""
 
     def _open_db(self, name: str):
-        if name in self._conn:
-            return self._conn[name]
         if self._live:
+            if name in self._conn:
+                return self._conn[name]
             session = get_live_session()
             if not session:
                 return None
@@ -246,6 +310,19 @@ class WeComPlatform(BasePlatform):
             db_path = os.path.join(self._decrypted_dir, name)
             if not os.path.exists(db_path):
                 return None
+            cached = self._conn.get(name)
+            try:
+                mtime = os.path.getmtime(db_path)
+            except OSError:
+                mtime = None
+            if cached is not None and self._conn_mtime.get(name) == mtime:
+                return cached
+            if cached is not None:
+                cached.close()
+                self._conn.pop(name, None)
+            self._conn[name] = sqlite3.connect(db_path)
+            self._conn_mtime[name] = mtime
+            return self._conn[name]
         self._conn[name] = sqlite3.connect(db_path)
         return self._conn[name]
 
@@ -359,8 +436,6 @@ class WeComPlatform(BasePlatform):
                 return int(part)
         if self._inferred_self_id:
             return self._inferred_self_id
-        counts = {}
-        session_n = 0
         session_db = self._open_db("session.db")
         cids = []
         if session_db and self._table_exists(session_db, "conversation_table"):
@@ -368,20 +443,10 @@ class WeComPlatform(BasePlatform):
                 row[0]
                 for row in session_db.execute("SELECT id FROM conversation_table")
             ]
-        for cid in cids:
-            if not str(cid).startswith("S:"):
-                continue
-            ids = [int(x) for x in str(cid)[2:].split("_") if x.isdigit()]
-            if len(ids) < 2:
-                continue
-            session_n += 1
-            for uid in ids:
-                counts[uid] = counts.get(uid, 0) + 1
-        for uid, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
-            if session_n >= 2 and n == session_n:
-                self._inferred_self_id = uid
-                return uid
-        return None
+        inferred = _infer_self_user_id(cids)
+        if inferred:
+            self._inferred_self_id = inferred
+        return inferred
 
     def list_sessions(self, limit: int = 100) -> List[ChatSession]:
         """List WeCom chat sessions from decrypted databases."""
@@ -495,7 +560,7 @@ class WeComPlatform(BasePlatform):
                     filename_hint = attachment_name or self._filename_hint(text)
                     result.append(ChatMessage(
                         time=dt,
-                        time_text=dt.strftime("%H:%M") if dt else "",
+                        time_text=dt.strftime("%Y-%m-%d %H:%M") if dt else "",
                         hour=dt.hour if dt else None,
                         sender=sender,
                         sender_id=str(sender_id),

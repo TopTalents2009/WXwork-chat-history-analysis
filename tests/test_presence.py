@@ -82,7 +82,13 @@ class PresenceHubTests(unittest.TestCase):
         self.assertEqual(known[0]["source_id"], "sky")
         self.assertEqual(known[0]["operator_name"], "唐利萍")
 
-    def test_updating_stays_visible(self):
+    def test_heartbeat_keeps_agent_version(self):
+        clock = Clock()
+        hub = PresenceHub(now=clock.now)
+        hub.heartbeat("pc-a", "张三", "PC-A", "192.168.2.14", "online", "2026.09.21.1")
+        self.assertEqual(hub.snapshot()["online"][0]["agent_version"], "2026.09.21.1")
+        hub.heartbeat("pc-a", "张三", "PC-A", "192.168.2.14")
+        self.assertEqual(hub.snapshot()["online"][0]["agent_version"], "2026.09.21.1")
         clock = Clock()
         hub = PresenceHub(now=clock.now)
         hub.heartbeat("pc-a", "张三", "PC-A", "192.168.2.14")

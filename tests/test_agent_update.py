@@ -42,3 +42,21 @@ class AgentUpdateManifestTests(unittest.TestCase):
     def test_missing_exe_returns_none(self):
         os.remove(self.exe)
         self.assertIsNone(agent_update.build_manifest(self.root))
+
+    def test_latest_info_without_exe(self):
+        os.remove(self.exe)
+        info = agent_update.latest_info(self.root)
+        self.assertEqual(info["version"], "2026.09.16.1")
+        self.assertFalse(info["published"])
+
+    def test_version_newer(self):
+        self.assertTrue(agent_update.version_newer("2026.09.21.2", "2026.09.21.1"))
+        self.assertFalse(agent_update.version_newer("2026.09.20.3", "2026.09.21.1"))
+
+    def test_push_hub_pending_then_accept(self):
+        hub = agent_update.PushHub()
+        job = hub.request("pc-a", "2026.09.21.2")
+        self.assertEqual(job["kind"], "update")
+        self.assertEqual(len(hub.pending_for("pc-a")), 1)
+        hub.mark_accepted(job["job_id"])
+        self.assertEqual(hub.pending_for("pc-a"), [])

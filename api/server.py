@@ -29,7 +29,7 @@ import importlib
 _wechat_mod = importlib.import_module('core-wechat.chat_platform')
 _wecom_mod = importlib.import_module('core-wecom.chat_platform')
 _dingtalk_mod = importlib.import_module('core-dingtalk.chat_platform')
-from shared import agent_update, api_keys, file_jobs, lan, message_search, synced_store
+from shared import agent_logs, agent_update, api_keys, file_jobs, lan, message_search, sync_now, synced_store
 from shared.presence import PresenceHub
 from shared.wecom_ssh import load_live_manifest, strip_jsonc
 import json
@@ -151,15 +151,18 @@ class SourceInfo(BaseModel):
     last_sync: str = ""
     session_count: int = 0
     platform: str = "wecom"
+    agent_version: str = ""
+    update_available: bool = False
 
 
 class AgentUpdateInfo(BaseModel):
     version: str
-    sha256: str
-    size: int
+    sha256: str = ""
+    size: int = 0
     url: str = "/api/ingest/agent-exe"
     notes: str = ""
     changelog: list = []
+    published: bool = False
 
 
 class SearchHit(BaseModel):
@@ -199,6 +202,7 @@ class IngestInfo(BaseModel):
     web_urls: List[str] = []
     read_api: Optional[ReadApiInfo] = None
     agent_update: Optional[AgentUpdateInfo] = None
+    latest_agent_version: str = ""
 
 
 _platforms_cache = {}
@@ -376,8 +380,121 @@ def _enrich_local_source(local: dict, clients: list) -> dict:
             local["username"] = name
         if host:
             local["host"] = host
+        version = str(client.get("agent_version") or "").strip()
+        if version:
+            local["agent_version"] = version
         break
     return local
+
+
+def _match_presence_client(
+    source_id: str = "",
+    computer: str = "",
+    host: str = "",
+    operator_name: str = "",
+    clients: Optional[list] = None,
+) -> Optional[dict]:
+    items = clients if clients is not None else presence.known_clients()
+    source_id = str(source_id or "").strip()
+    computer = _bare_computer(computer)
+    host = str(host or "").strip()
+    operator_name = str(operator_name or "").strip()
+    for client in items:
+        cid = str(client.get("source_id") or "").strip()
+        if source_id and cid and source_id == cid:
+            return client
+    for client in items:
+        if _same_machine(
+            computer,
+            host,
+            str(client.get("computer_name") or ""),
+            str(client.get("host") or ""),
+        ):
+            return client
+    if operator_name:
+        for client in items:
+            if str(client.get("operator_name") or "").strip() == operator_name:
+                return client
+    return None
+
+
+def _attach_agent_fields(items: List[SourceInfo]) -> List[SourceInfo]:
+    known = presence.known_clients()
+    latest = agent_update.read_version(PROJECT_DIR) or (
+        (_agent_update_payload() or {}).get("version") or ""
+    )
+    for item in items:
+        client = _match_presence_client(
+            item.id, item.computer_name, item.host, item.operator_name, known,
+        )
+        if not client:
+            continue
+        version = str(client.get("agent_version") or "").strip()
+        if version:
+            item.agent_version = version
+        if latest and item.agent_version:
+            item.update_available = agent_update.version_newer(latest, item.agent_version)
+    return items
+
+
+def _resolve_agent_source_id(source_id: str) -> str:
+    source_id = str(source_id or "").strip()
+    if not source_id:
+        raise HTTPException(status_code=400, detail="source_id is required")
+    if source_id == "local":
+        local = _local_source()
+        known = presence.known_clients()
+        local_ips = _local_ip_set()
+        for client in known:
+            computer = str(client.get("computer_name") or "")
+            host = str(client.get("host") or "")
+            if _is_this_pc(computer, host, local, local_ips):
+                return str(client.get("source_id") or source_id)
+        return source_id
+    client = _match_presence_client(source_id)
+    if client and client.get("source_id"):
+        return str(client["source_id"])
+    return source_id
+
+
+def _agent_is_online(source_id: str) -> bool:
+    wanted = str(source_id or "").strip()
+    if not wanted:
+        return False
+    for item in presence.snapshot().get("online") or []:
+        if str(item.get("source_id") or "") == wanted:
+            return True
+    return False
+
+
+def _log_payload(source_id: str, job: Optional[dict] = None) -> dict:
+    path = ""
+    status = "missing"
+    detail = ""
+    job_id = ""
+    updated = 0.0
+    if job:
+        status = str(job.get("status") or "")
+        detail = str(job.get("detail") or "")
+        job_id = str(job.get("job_id") or "")
+        path = str(job.get("path") or "")
+        updated = float(job.get("updated") or 0)
+    if not path:
+        path = agent_logs.stored_path(source_id)
+        if path and status in ("", "missing"):
+            status = "ready"
+    text = agent_logs.read_log_text(path) if path else ""
+    return {
+        "ok": True,
+        "source_id": source_id,
+        "job_id": job_id,
+        "status": status or "missing",
+        "detail": detail,
+        "text": text,
+        "size": len(text.encode("utf-8")) if text else 0,
+        "updated": updated,
+        "filename": f"{source_id}-agent.log",
+    }
 
 
 def _local_source() -> Optional[dict]:
@@ -459,7 +576,7 @@ def _agent_update_payload() -> Optional[dict]:
 
 @app.get("/api/ingest/info")
 async def ingest_info():
-    update = _agent_update_payload()
+    latest = agent_update.latest_info(PROJECT_DIR)
     api_urls = _lan_urls(8767)
     read_api = ReadApiInfo(**api_keys.homepage_info(api_urls))
     return IngestInfo(
@@ -469,7 +586,8 @@ async def ingest_info():
         web_port=5173,
         web_urls=_lan_urls(5173),
         read_api=read_api,
-        agent_update=AgentUpdateInfo(**update) if update else None,
+        agent_update=AgentUpdateInfo(**latest) if latest.get("version") else None,
+        latest_agent_version=str(latest.get("version") or ""),
     )
 
 
@@ -528,9 +646,23 @@ async def list_sources():
             last_sync=last_sync,
             session_count=0,
             platform="wecom",
+            agent_version=str(client.get("agent_version") or ""),
         ))
         seen.add(sid)
-    return items
+    return _attach_agent_fields(items)
+
+
+@app.post("/api/ingest/cursors")
+async def ingest_cursors(payload: dict, x_ingest_token: Optional[str] = Header(None)):
+    _check_ingest_token(str(payload.get("token") or ""), x_ingest_token or "")
+    source_id = _client_source_id(payload)
+    if not synced_store.get_source(source_id):
+        return {"ok": True, "source_id": source_id, "cursors": {}}
+    return {
+        "ok": True,
+        "source_id": source_id,
+        "cursors": synced_store.message_cursors(source_id),
+    }
 
 
 @app.post("/api/ingest/wecom")
@@ -569,9 +701,13 @@ async def ingest_heartbeat(
         payload.get("computer_name") or "",
         _peer_host(request, payload),
         str(payload.get("status") or "online"),
+        str(payload.get("agent_version") or ""),
     )
     result["source_id"] = source_id
     result["jobs"] = file_jobs.hub.pending_for(source_id)
+    result["log_jobs"] = agent_logs.hub.pending_for(source_id)
+    result["update_jobs"] = agent_update.push_hub.pending_for(source_id)
+    result["sync_jobs"] = sync_now.hub.pending_for(source_id)
     result["agent_update"] = _agent_update_payload()
     return result
 
@@ -598,7 +734,10 @@ async def ingest_file(
     try:
         job = file_jobs.hub.save_bytes(job_id, filename, data)
     except KeyError:
-        raise HTTPException(status_code=404, detail="job not found")
+        try:
+            job = agent_logs.hub.save_bytes(job_id, filename, data)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="job not found")
     except ValueError as exc:
         code = 413 if "large" in str(exc) else 400
         raise HTTPException(status_code=code, detail=str(exc))
@@ -615,9 +754,23 @@ async def ingest_file_result(payload: dict, x_ingest_token: Optional[str] = Head
     detail = str(payload.get("detail") or "")
     try:
         if status == "missing":
-            job = file_jobs.hub.mark_missing(job_id, detail)
+            try:
+                job = file_jobs.hub.mark_missing(job_id, detail)
+            except KeyError:
+                job = agent_logs.hub.mark_missing(job_id, detail)
+        elif status == "accepted":
+            try:
+                job = agent_update.push_hub.mark_accepted(job_id, detail)
+            except KeyError:
+                job = sync_now.hub.mark_accepted(job_id, detail)
         elif status == "error":
-            job = file_jobs.hub.mark_error(job_id, detail)
+            try:
+                job = file_jobs.hub.mark_error(job_id, detail)
+            except KeyError:
+                try:
+                    job = agent_logs.hub.mark_error(job_id, detail)
+                except KeyError:
+                    job = agent_update.push_hub.mark_error(job_id, detail)
         else:
             raise HTTPException(status_code=400, detail="unsupported status")
     except KeyError:
@@ -661,6 +814,96 @@ def ingest_agent_exe(
 @app.get("/api/presence")
 async def get_presence(since: int = Query(0, ge=0)):
     return presence.snapshot(since_id=since)
+
+
+@app.post("/api/sources/{source_id}/agent-log")
+async def request_agent_log(source_id: str):
+    sid = _resolve_agent_source_id(source_id)
+    if not _agent_is_online(sid):
+        raise HTTPException(status_code=409, detail="助手离线，无法回传日志")
+    try:
+        job = agent_logs.hub.request(sid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "source_id": sid,
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "detail": "正在等待助手回传日志",
+    }
+
+
+@app.post("/api/sources/{source_id}/sync-now")
+async def request_sync_now(source_id: str):
+    sid = _resolve_agent_source_id(source_id)
+    if not _agent_is_online(sid):
+        raise HTTPException(status_code=409, detail="助手离线，无法立即同步")
+    try:
+        job = sync_now.hub.request(sid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "source_id": sid,
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "detail": "已通知助手立即同步，下一次心跳后开始",
+    }
+
+
+@app.post("/api/sources/{source_id}/agent-update")
+async def request_agent_update(source_id: str):
+    sid = _resolve_agent_source_id(source_id)
+    if not _agent_is_online(sid):
+        raise HTTPException(status_code=409, detail="助手离线，无法推送更新")
+    for item in presence.snapshot().get("online") or []:
+        if str(item.get("source_id") or "") == sid and str(item.get("status") or "") == "updating":
+            raise HTTPException(status_code=409, detail="助手正在更新")
+    manifest = _agent_update_payload()
+    if not manifest:
+        raise HTTPException(status_code=409, detail="尚未打包助手更新包，请先运行 build_agent.bat")
+    try:
+        job = agent_update.push_hub.request(sid, str(manifest.get("version") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "source_id": sid,
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "version": manifest.get("version") or "",
+        "detail": f"已通知助手更新到 {manifest.get('version')}",
+    }
+
+
+@app.get("/api/sources/{source_id}/agent-log")
+async def get_agent_log(source_id: str, job_id: str = Query("")):
+    sid = _resolve_agent_source_id(source_id)
+    job = agent_logs.hub.get(job_id) if job_id else None
+    if job_id and not job:
+        raise HTTPException(status_code=404, detail="日志任务不存在")
+    if job and job.get("status") == "pending":
+        return JSONResponse(status_code=202, content=_log_payload(sid, job))
+    if job and job.get("status") == "error":
+        raise HTTPException(status_code=409, detail=job.get("detail") or "回传失败")
+    if job and job.get("status") == "missing":
+        raise HTTPException(status_code=404, detail=job.get("detail") or "助手尚未产生日志")
+    payload = _log_payload(sid, job)
+    if payload["status"] != "ready" or not payload["text"]:
+        if job and job.get("status") == "ready":
+            return payload
+        raise HTTPException(status_code=404, detail="还没有回传过日志")
+    return payload
+
+
+@app.get("/api/sources/{source_id}/agent-log/file")
+def download_agent_log(source_id: str):
+    sid = _resolve_agent_source_id(source_id)
+    path = agent_logs.stored_path(sid)
+    if not path:
+        raise HTTPException(status_code=404, detail="还没有回传过日志")
+    return _file_response(path, f"{sid}-agent.log")
 
 
 def _local_platform_or_none():
@@ -744,10 +987,15 @@ async def get_source_messages(
         start_time = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
         end_time = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1) if end_date else None
         messages = plat.query_messages(session_id, start_time=start_time, end_time=end_time, limit=limit)
-        return [_message_response(m) for m in messages]
+        # query_messages is newest-first; the page reads oldest-first and scrolls to the end.
+        return [_message_response(m) for m in reversed(list(messages))]
     if not synced_store.get_source(source_id):
         raise HTTPException(status_code=404, detail="Unknown computer")
-    rows = synced_store.list_messages(source_id, session_id, limit=limit)
+    fetch_all = bool(start_date or end_date)
+    rows = synced_store.list_messages(source_id, session_id, limit=0 if fetch_all else limit)
+    rows = synced_store.filter_messages_by_date(rows, start_date or "", end_date or "")
+    if limit and len(rows) > int(limit):
+        rows = rows[-int(limit):]
     return [_message_response(m) for m in rows]
 
 

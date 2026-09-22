@@ -50,6 +50,7 @@ MAX_AGENT_BYTES = 120 * 1024 * 1024
 UPDATE_RETRY_SEC = 30 * 60
 SYNC_BATCH_SIZE = 25
 MESSAGE_EXPORT_LIMIT = 0
+MESSAGE_TABLES = ("message_table", "message_small_table", "kf_message_tableV1")
 AUTOSTART_NAME = "WeComSyncAgent"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -357,21 +358,89 @@ def _prepare_decrypt_config():
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 
+class _LineCapture:
+    """Tee decrypt tool prints so failures show up in agent.log."""
+
+    def __init__(self, orig, lines, limit=80):
+        self.orig = orig
+        self.lines = lines
+        self.limit = limit
+        self._buf = ""
+
+    def write(self, text):
+        if self.orig:
+            try:
+                self.orig.write(text)
+            except Exception:
+                pass
+        self._buf += str(text or "")
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            self.lines.append(line)
+            if len(self.lines) > self.limit:
+                del self.lines[: len(self.lines) - self.limit]
+
+    def flush(self):
+        if self.orig:
+            try:
+                self.orig.flush()
+            except Exception:
+                pass
+
+    def isatty(self):
+        return False
+
+
+def decrypt_failure_message(prefix: str, lines=None, code=None) -> str:
+    head = prefix if code in (0, None) else f"{prefix}（退出码 {code}）"
+    tail = [str(ln).strip() for ln in (lines or []) if str(ln).strip()][-4:]
+    if not tail:
+        return head
+    return head + "。" + " ".join(tail)
+
+
+def _guard_systemexit(fn, prefix: str, lines=None):
+    try:
+        return fn()
+    except SystemExit as exc:
+        if exc.code in (0, None):
+            return None
+        raise RuntimeError(decrypt_failure_message(prefix, lines, exc.code)) from None
+
+
 def _run_decrypt():
     if not os.path.isdir(TOOLS_DIR):
         raise RuntimeError(f"找不到解密工具目录: {TOOLS_DIR}")
     _prepare_decrypt_config()
-    sys.path.insert(0, TOOLS_DIR)
+    if TOOLS_DIR not in sys.path:
+        sys.path.insert(0, TOOLS_DIR)
     old_cwd = os.getcwd()
     os.chdir(TOOLS_DIR)
+    captured = []
+    old_stdout, old_stderr = sys.stdout, sys.stderr
     try:
         import find_wxwork_keys
         import decrypt_wxwork_db
-        find_wxwork_keys.main()
-        code = decrypt_wxwork_db.main([])
+        sys.stdout = _LineCapture(old_stdout, captured)
+        sys.stderr = _LineCapture(old_stderr, captured)
+        _guard_systemexit(find_wxwork_keys.main, "提取密钥失败", captured)
+        code = _guard_systemexit(
+            lambda: decrypt_wxwork_db.main([]),
+            "解密失败",
+            captured,
+        )
         if code not in (0, None):
-            raise RuntimeError("解密失败")
+            raise RuntimeError(decrypt_failure_message("解密失败", captured, code))
+    except Exception as exc:
+        text = str(exc)
+        if captured and captured[-1] not in text:
+            raise RuntimeError(decrypt_failure_message(text, captured)) from None
+        raise
     finally:
+        sys.stdout, sys.stderr = old_stdout, old_stderr
         os.chdir(old_cwd)
 
 
@@ -445,7 +514,7 @@ def _self_user_id(conversations=None):
         if len(ids) < 2:
             continue
         session_n += 1
-        for uid in ids:
+        for uid in set(ids):
             counts[uid] = counts.get(uid, 0) + 1
     for uid, n in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
         if session_n >= 2 and n == session_n:
@@ -765,6 +834,14 @@ def download_agent_exe(url: str, token: str, dest: str, expected_size: int, expe
     return dest
 
 
+def _append_log(text: str) -> None:
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+    except OSError:
+        pass
+
+
 def write_updater_script(pid: int, src: str, dest: str, extra_args: list) -> str:
     folder = os.path.join(WORK_DIR, "update")
     os.makedirs(folder, exist_ok=True)
@@ -781,6 +858,7 @@ def write_updater_script(pid: int, src: str, dest: str, extra_args: list) -> str
             handle,
             ensure_ascii=True,
         )
+    # Exit first, then replace the exe. Waiting on the UI thread left the file locked.
     script = r"""$ErrorActionPreference = 'Continue'
 $planPath = Join-Path $PSScriptRoot 'plan.json'
 $logPath = Join-Path $PSScriptRoot 'apply.log'
@@ -789,28 +867,40 @@ function Write-Log($m) {
 }
 $plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
 $waitPid = [int]$plan.pid
-for ($i = 0; $i -lt 80; $i++) {
-  if (-not (Get-Process -Id $waitPid -ErrorAction SilentlyContinue)) { break }
-  Start-Sleep -Milliseconds 250
-}
+Write-Log "stopping $waitPid"
+Stop-Process -Id $waitPid -Force -ErrorAction SilentlyContinue
 Get-Process WeComSyncAgent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+for ($i = 0; $i -lt 40; $i++) {
+  $left = @(Get-Process WeComSyncAgent -ErrorAction SilentlyContinue)
+  if ($left.Count -eq 0) { break }
+  Start-Sleep -Milliseconds 250
+  Get-Process WeComSyncAgent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
 $copied = $false
-for ($i = 0; $i -lt 25; $i++) {
-  Start-Sleep -Milliseconds 400
+for ($i = 0; $i -lt 40; $i++) {
   try {
     Copy-Item -LiteralPath $plan.src -Destination $plan.dst -Force
-    $copied = $true
-    break
+    $srcLen = (Get-Item -LiteralPath $plan.src).Length
+    $dstLen = (Get-Item -LiteralPath $plan.dst).Length
+    if ($srcLen -eq $dstLen) {
+      $copied = $true
+      break
+    }
+    Write-Log "size mismatch $dstLen $srcLen"
   } catch {
     Write-Log $_
   }
+  Start-Sleep -Milliseconds 500
 }
-if (-not $copied) { Write-Log 'copy failed, launching existing exe' }
-$launch = $plan.dst
-if (-not (Test-Path -LiteralPath $launch)) { $launch = $plan.src }
+if (-not $copied) {
+  Write-Log 'copy failed'
+  exit 1
+}
+$lock = Join-Path (Split-Path -Parent $PSScriptRoot) 'agent.lock'
+Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
 $argList = @('--background')
-Start-Process -FilePath $launch -ArgumentList $argList
-Write-Log "started $launch"
+Start-Process -FilePath $plan.dst -ArgumentList $argList
+Write-Log "started $($plan.dst)"
 """
     with open(script_path, "w", encoding="utf-8") as handle:
         handle.write(script)
@@ -948,6 +1038,8 @@ def upload_attachment(server_url: str, token: str, job_id: str, message_id: int,
 
 
 def process_file_job(server_url: str, token: str, job: dict) -> str:
+    if str((job or {}).get("kind") or "") == "log":
+        return process_log_job(server_url, token, job)
     job_id = str(job.get("job_id") or "")
     message_id = int(job.get("message_id") or 0)
     filename = str(job.get("filename") or "")
@@ -961,58 +1053,230 @@ def process_file_job(server_url: str, token: str, job: dict) -> str:
     return "ready"
 
 
-def export_messages(conversation_id: str, users: dict, limit: int = MESSAGE_EXPORT_LIMIT, room_nicks: dict = None):
+MAX_LOG_UPLOAD_BYTES = 512 * 1024
+
+
+def read_agent_log_bytes(path: str, max_bytes: int = MAX_LOG_UPLOAD_BYTES) -> bytes:
+    if not path or not os.path.isfile(path):
+        return b""
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        if size > max_bytes:
+            handle.seek(max(0, size - max_bytes))
+            data = handle.read()
+            data = data.split(b"\n", 1)[-1]
+        else:
+            data = handle.read()
+    return data
+
+
+def process_log_job(server_url: str, token: str, job: dict) -> str:
+    job_id = str((job or {}).get("job_id") or "")
+    if not job_id:
+        return "error"
+    if not os.path.isfile(LOG_FILE):
+        report_file_job(server_url, token, job_id, "missing", "助手尚未产生日志")
+        return "missing"
+    data = read_agent_log_bytes(LOG_FILE)
+    if not data:
+        data = "（日志文件为空）\n".encode("utf-8")
+    url = server_url.rstrip("/") + "/api/ingest/file"
+    req = request.Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/octet-stream",
+        "X-Ingest-Token": token,
+        "X-Job-Id": job_id,
+        "X-Filename": quote("agent.log", safe=""),
+    })
+    with request.urlopen(req, timeout=60) as resp:
+        json.loads(resp.read().decode("utf-8"))
+    return "ready"
+
+
+def _cursor_map(raw) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for cid, entry in raw.items():
+        if not cid or not isinstance(entry, dict):
+            continue
+        tables = {}
+        for table, value in entry.items():
+            try:
+                tables[str(table)] = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+        if tables:
+            out[str(cid)] = tables
+    return out
+
+
+def _table_cursor(cursors: dict, conversation_id: str, table: str):
+    """None means this table has never been synced for the conversation."""
+    entry = (cursors or {}).get(str(conversation_id))
+    if not isinstance(entry, dict) or table not in entry:
+        return None
+    try:
+        return int(entry.get(table) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _message_id_column(cols: list) -> str:
+    if "message_id" in cols:
+        return "message_id"
+    if "id" in cols:
+        return "id"
+    return ""
+
+
+def _message_record(row: dict, conversation_id: str, users: dict, room_nicks: dict, decoder) -> dict:
+    ts = row.get("send_time")
+    dt = datetime.fromtimestamp(ts) if ts else None
+    sender_raw = row.get("sender_id")
+    if sender_raw in (None, ""):
+        sender_raw = row.get("sender")
+    sender = _resolve_sender(sender_raw, conversation_id, users, room_nicks)
+    content_type = int(row.get("content_type") or 0)
+    text, media_url, attachment_name = decoder.build_display_fields(
+        content_type,
+        row.get("content"),
+        row.get("extra_content") or "",
+        row.get("local_extra_content") or "",
+    )
+    if len(text) > 4000:
+        text = text[:4000]
+    return {
+        "time_text": dt.strftime("%Y-%m-%d %H:%M") if dt else "",
+        "hour": dt.hour if dt else None,
+        "sender": sender,
+        "sender_id": "" if sender_raw in (None, "") else str(sender_raw),
+        "text": text,
+        "msg_type": content_type,
+        "msg_type_label": decoder.message_type_name(content_type),
+        "message_id": int(row.get("message_id") or row.get("id") or 0),
+        "has_attachment": content_type in (4, 7, 14, 15, 16, 20) or bool(media_url or attachment_name),
+        "attachment_name": attachment_name,
+        "media_url": media_url,
+    }
+
+
+def export_incremental(conversation_ids, users: dict, room_nicks: dict = None, cursors: dict = None):
+    """Export only messages newer than each conversation's stored message id.
+
+    Returns (messages_by_id, pending_cursors). pending_cursors is applied only
+    after those messages are accepted by the server.
+    """
+    room_nicks = room_nicks or {}
+    cursors = cursors or {}
+    wanted = []
+    seen = set()
+    for cid in conversation_ids or []:
+        text = str(cid or "")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        wanted.append(text)
+    grouped = {}
+    pending = {}
+    if not wanted:
+        return grouped, pending
     conn = _open_db("message.db")
     if not conn:
-        return []
-    room_nicks = room_nicks or {}
-    out = []
+        return grouped, pending
     try:
-        for table in ("message_table", "message_small_table", "kf_message_tableV1"):
+        decoder = _decoder()
+        for table in MESSAGE_TABLES:
             if not _table_exists(conn, table):
                 continue
             cols = [d[0] for d in conn.execute(f'SELECT * FROM "{table}" LIMIT 1').description]
-            sql = f'SELECT * FROM "{table}" WHERE conversation_id = ? ORDER BY send_time DESC'
-            params = [conversation_id]
-            if limit and int(limit) > 0:
-                sql += " LIMIT ?"
-                params.append(int(limit))
-            rows = conn.execute(sql, tuple(params)).fetchall()
-            for row in rows:
-                m = dict(zip(cols, row))
-                ts = m.get("send_time")
-                dt = datetime.fromtimestamp(ts) if ts else None
-                sender_raw = m.get("sender_id")
-                if sender_raw in (None, ""):
-                    sender_raw = m.get("sender")
-                sender = _resolve_sender(sender_raw, conversation_id, users, room_nicks)
-                content_type = int(m.get("content_type") or 0)
-                dec = _decoder()
-                text, media_url, attachment_name = dec.build_display_fields(
-                    content_type,
-                    m.get("content"),
-                    m.get("extra_content") or "",
-                    m.get("local_extra_content") or "",
-                )
-                if len(text) > 4000:
-                    text = text[:4000]
-                out.append({
-                    "time_text": dt.strftime("%Y-%m-%d %H:%M") if dt else "",
-                    "hour": dt.hour if dt else None,
-                    "sender": sender,
-                    "sender_id": "" if sender_raw in (None, "") else str(sender_raw),
-                    "text": text,
-                    "msg_type": content_type,
-                    "msg_type_label": dec.message_type_name(content_type),
-                    "message_id": int(m.get("message_id") or m.get("id") or 0),
-                    "has_attachment": content_type in (4, 7, 14, 15, 16, 20) or bool(media_url or attachment_name),
-                    "attachment_name": attachment_name,
-                    "media_url": media_url,
-                })
+            id_col = _message_id_column(cols)
+            if not id_col:
+                continue
+            highs = {}
+            for cid, max_id in conn.execute(
+                f'SELECT conversation_id, MAX("{id_col}") FROM "{table}" GROUP BY conversation_id'
+            ):
+                text = str(cid or "")
+                if text not in seen:
+                    continue
+                try:
+                    max_id = int(max_id or 0)
+                except (TypeError, ValueError):
+                    continue
+                prev = _table_cursor(cursors, text, table)
+                if prev is not None and max_id <= prev:
+                    continue
+                highs[text] = (prev, max_id)
+            for cid, (prev, max_id) in highs.items():
+                sql = f'SELECT * FROM "{table}" WHERE conversation_id = ?'
+                params = [cid]
+                if prev is not None:
+                    sql += f' AND "{id_col}" > ?'
+                    params.append(prev)
+                rows = conn.execute(sql, tuple(params)).fetchall()
+                bucket = grouped.setdefault(cid, [])
+                for row in rows:
+                    bucket.append(_message_record(
+                        dict(zip(cols, row)), cid, users, room_nicks, decoder,
+                    ))
+                pending.setdefault(cid, {})[table] = max_id
     finally:
         conn.close()
-    out.sort(key=lambda m: m.get("time_text") or "")
+    for cid, messages in grouped.items():
+        messages.sort(key=lambda m: ((m.get("time_text") or ""), int(m.get("message_id") or 0)))
+    return grouped, pending
+
+
+def export_messages(conversation_id: str, users: dict, limit: int = MESSAGE_EXPORT_LIMIT,
+                    room_nicks: dict = None):
+    grouped, _pending = export_incremental([conversation_id], users, room_nicks or {}, {})
+    out = grouped.get(str(conversation_id), [])
+    if limit and int(limit) > 0 and len(out) > int(limit):
+        return out[-int(limit):]
     return out
+
+
+def fetch_server_cursors(server_url: str, token: str, operator_name: str = "") -> dict:
+    payload = {"token": token, **client_identity(operator_name)}
+    result = _post_json(server_url, "/api/ingest/cursors", payload, token, timeout=60)
+    raw = (result or {}).get("cursors") or {}
+    cursors = {}
+    if not isinstance(raw, dict):
+        return cursors
+    for cid, value in raw.items():
+        text = str(cid or "")
+        if not text:
+            continue
+        try:
+            cursors[text] = {"message_table": int(value or 0)}
+        except (TypeError, ValueError):
+            continue
+    return cursors
+
+
+def seed_cursors(server_url: str, token: str, cursors: dict, operator_name: str = "", log=None) -> dict:
+    """Use ids already on the server so the first incremental run is not a full upload."""
+    cursors = _cursor_map(cursors)
+    if cursors:
+        return cursors
+    try:
+        seeded = fetch_server_cursors(server_url, token, operator_name)
+    except Exception as exc:
+        if log:
+            log(f"读取服务器同步进度失败，本次改为全量上传: {exc}")
+        return {}
+    if log:
+        if seeded:
+            log(f"按服务器已有记录增量同步，{len(seeded)} 个会话")
+        else:
+            log("服务器还没有这些聊天记录，本次全量上传")
+    return seeded
+
+
+def save_sync_cursors(cursors: dict) -> None:
+    data = _load_settings()
+    data["sync_cursors"] = _cursor_map(cursors)
+    _save_settings(data)
 
 
 def _account_id() -> str:
@@ -1028,19 +1292,39 @@ def _account_id() -> str:
     return ""
 
 
-def push_sessions(server_url: str, token: str, selected: list, users: dict, log, operator_name: str = "", room_nicks: dict = None):
+def push_sessions(server_url: str, token: str, selected: list, users: dict, log,
+                  operator_name: str = "", room_nicks: dict = None, cursors: dict = None):
     identity = client_identity(operator_name)
+    if cursors is None:
+        cursors = {}
+    normalized = _cursor_map(cursors)
+    cursors.clear()
+    cursors.update(normalized)
+    grouped, pending = export_incremental(
+        [item.get("id") for item in (selected or [])],
+        users,
+        room_nicks or {},
+        cursors,
+    )
     last = {
         "saved_sessions": 0,
         "session_count": 0,
+        "new_messages": 0,
         "computer_name": identity.get("computer_name") or "",
     }
     batch = []
-    total = len(selected or [])
     saved_total = 0
+    new_total = 0
+    pending_items = [item for item in (selected or []) if grouped.get(str(item.get("id") or ""))]
+    total = len(pending_items)
+    if not pending_items:
+        log("增量同步：没有新消息")
+        last["cursors"] = cursors
+        return last
+    log(f"增量同步：{total} 个会话有新消息，共 {sum(len(grouped[str(item['id'])]) for item in pending_items)} 条")
 
     def flush():
-        nonlocal last, batch, saved_total
+        nonlocal last, batch, saved_total, new_total
         if not batch:
             return
         payload = {
@@ -1049,26 +1333,37 @@ def push_sessions(server_url: str, token: str, selected: list, users: dict, log,
             "sessions": batch,
         }
         result = _post_json(server_url, "/api/ingest/wecom", payload, token, timeout=180)
+        for item in batch:
+            cid = str(item.get("id") or "")
+            entry = cursors.setdefault(cid, {})
+            entry.update(pending.get(cid) or {})
+            new_total += len(item.get("messages") or [])
+        save_sync_cursors(cursors)
         saved_total += int((result or {}).get("saved_sessions") or 0)
         last = dict(result or last)
         last["saved_sessions"] = saved_total
+        last["new_messages"] = new_total
+        last["cursors"] = cursors
         batch = []
 
-    for index, item in enumerate(selected or [], 1):
-        log(f"读取 {item['display_name']}（{index}/{total}）...")
-        messages = export_messages(item["id"], users, room_nicks=room_nicks or {})
+    for index, item in enumerate(pending_items, 1):
+        cid = str(item.get("id") or "")
+        messages = grouped.get(cid) or []
+        log(f"上传 {item['display_name']} {len(messages)} 条（{index}/{total}）...")
         batch.append({
-            "id": item["id"],
-            "username": item["id"],
+            "id": cid,
+            "username": cid,
             "display_name": item["display_name"],
             "session_type": item["session_type"],
             "last_time": item["last_time"],
-            "msg_count": len(messages) or item["msg_count"],
+            "msg_count": item.get("msg_count") or len(messages),
             "messages": messages,
         })
         if len(batch) >= SYNC_BATCH_SIZE:
             flush()
     flush()
+    last["cursors"] = cursors
+    last["new_messages"] = new_total
     return last
 
 
@@ -1440,6 +1735,7 @@ class AgentApp:
             "seen_conversation_ids": sorted(seen),
             "setup_done": bool(self.settings.get("setup_done")),
             "last_seen_version": str(self.settings.get("last_seen_version") or ""),
+            "sync_cursors": _cursor_map(self.settings.get("sync_cursors")),
         }
         self.settings = data
         _save_settings(data)
@@ -1447,7 +1743,7 @@ class AgentApp:
     def _on_auto_toggle(self):
         self._persist_settings()
         if self.auto_var.get():
-            self.log("已开启每 5 分钟自动同步，将上传全部群聊和单聊")
+            self.log("已开启每 5 分钟自动同步，只上传新消息")
             self.status_var.set("约 8 秒后开始自动同步")
             self._schedule_auto(8000)
         else:
@@ -1499,31 +1795,80 @@ class AgentApp:
             jobs = (resp or {}).get("jobs") or []
             if jobs:
                 self.root.after(0, lambda: self._dispatch_file_jobs(server, token, jobs))
+            log_jobs = (resp or {}).get("log_jobs") or []
+            if log_jobs:
+                self.root.after(0, lambda: self._dispatch_file_jobs(server, token, log_jobs))
             info = (resp or {}).get("agent_update") or {}
-            if info:
+            update_jobs = (resp or {}).get("update_jobs") or []
+            if update_jobs:
+                self.root.after(0, lambda: self._accept_update_jobs(server, token, info, update_jobs))
+            sync_jobs = (resp or {}).get("sync_jobs") or []
+            if sync_jobs:
+                self.root.after(0, lambda jobs=sync_jobs: self._accept_sync_jobs(server, token, jobs))
+            elif info:
                 self.root.after(0, lambda: self._start_update(server, token, info))
         except Exception as exc:
             if not self._hb_fail_logged:
                 self.root.after(0, lambda: self.log(f"在线心跳失败: {exc}"))
                 self._hb_fail_logged = True
 
-    def _start_update(self, server, token, info):
-        if self._busy or self._updating or self._active_jobs:
-            return
-        if time.time() < self._update_retry_after:
+    def _accept_sync_jobs(self, server, token, jobs):
+        self.log("收到立即同步")
+        self._ack_update_jobs(server, token, jobs, "助手已开始同步")
+        self._auto_cycle(force=True)
+
+    def _accept_update_jobs(self, server, token, info, jobs):
+        self._start_update(server, token, info, force=True, jobs=jobs)
+
+    def _start_update(self, server, token, info, force=False, jobs=None):
+        if self._updating:
             return
         if not is_frozen():
+            if force:
+                self.log("当前不是打包版助手，无法在线替换")
+                self._ack_update_jobs(server, token, jobs, "当前不是打包版助手")
             return
-        if not should_apply_update(AGENT_VERSION, info, current_exe_sha256()):
+        if not info or not str(info.get("sha256") or "").strip() or int(info.get("size") or 0) <= 0:
+            if force:
+                self.log("服务器尚未发布助手更新包")
+                self._ack_update_jobs(server, token, jobs, "服务器尚未发布助手更新包")
+            return
+        current = current_exe_sha256()
+        remote_sha = str(info.get("sha256") or "").strip().lower()
+        if current and remote_sha == current.lower():
+            if force:
+                self.log(f"已是最新版本 {info.get('version')}，无需更新")
+                self._ack_update_jobs(server, token, jobs, "已是最新版本")
+            return
+        if not force:
+            if self._busy or self._active_jobs:
+                return
+            if time.time() < self._update_retry_after:
+                return
+            if not should_apply_update(AGENT_VERSION, info, current):
+                return
+        elif self._active_jobs:
+            self.log("有文件任务进行中，稍后再推送更新")
             return
         self._updating = True
+        self._ack_update_jobs(server, token, jobs, "助手已开始更新")
         remote = str(info.get("version") or "")
-        self.log(f"发现新版本 {remote}，正在下载...")
+        self.log(f"{'收到推送，正在更新到' if force else '发现新版本'} {remote}，正在下载...")
         threading.Thread(
             target=self._update_worker,
             args=(server, token, info),
             daemon=True,
         ).start()
+
+    def _ack_update_jobs(self, server, token, jobs, detail=""):
+        for job in jobs or []:
+            job_id = str(job.get("job_id") or "")
+            if not job_id:
+                continue
+            try:
+                report_file_job(server, token, job_id, "accepted", detail)
+            except Exception:
+                pass
 
     def _update_worker(self, server, token, info):
         try:
@@ -1545,10 +1890,9 @@ class AgentApp:
             except Exception:
                 pass
             apply_downloaded_update(new_path, app_executable(), extra)
-            self.root.after(0, lambda: self.log(
-                f"新版本 {info.get('version')} 已就绪，正在重启助手"
-            ))
-            self.root.after(300, self._exit_for_update)
+            _append_log(f"新版本 {info.get('version')} 已就绪，正在重启助手")
+            release_instance_lock()
+            os._exit(0)
         except Exception as exc:
             self._updating = False
             self._update_retry_after = time.time() + UPDATE_RETRY_SEC
@@ -1575,8 +1919,11 @@ class AgentApp:
                 queued.append(job)
         if not queued:
             return
-        names = [str(j.get("filename") or j.get("message_id") or "") for j in queued]
-        self.log("远端请求文件: " + "、".join(names))
+        names = [str(j.get("filename") or j.get("kind") or j.get("message_id") or "") for j in queued]
+        if any(str(j.get("kind") or "") == "log" for j in queued):
+            self.log("远端请求助手日志")
+        else:
+            self.log("远端请求文件: " + "、".join(names))
         threading.Thread(
             target=self._file_jobs_worker,
             args=(server, token, queued),
@@ -1589,13 +1936,15 @@ class AgentApp:
             name = str(job.get("filename") or job.get("message_id") or job_id)
             try:
                 result = process_file_job(server, token, job)
-                self.root.after(0, lambda n=name, r=result: self.log(f"文件回传完成: {n} ({r})"))
+                kind = "日志" if str(job.get("kind") or "") == "log" else "文件"
+                self.root.after(0, lambda n=name, r=result, k=kind: self.log(f"{k}回传完成: {n} ({r})"))
             except Exception as exc:
                 try:
                     report_file_job(server, token, job_id, "error", str(exc))
                 except Exception:
                     pass
-                self.root.after(0, lambda e=exc, n=name: self.log(f"文件回传失败: {n}: {e}"))
+                kind = "日志" if str(job.get("kind") or "") == "log" else "文件"
+                self.root.after(0, lambda e=exc, n=name, k=kind: self.log(f"{k}回传失败: {n}: {e}"))
             finally:
                 with self._job_lock:
                     self._active_jobs.discard(job_id)
@@ -1607,14 +1956,17 @@ class AgentApp:
         self.status_var.set(f"下次自动同步 {next_time.strftime('%H:%M:%S')}")
         self._auto_job = self.root.after(wait, self._auto_cycle)
 
-    def _auto_cycle(self):
+    def _auto_cycle(self, force=False):
         self._auto_job = None
-        if not self.auto_var.get():
+        if not force and not self.auto_var.get():
             self.status_var.set("自动同步已关闭")
             return
         if self._busy:
-            self.log("上一次任务尚未结束，5 分钟后重试")
-            self._schedule_auto()
+            if force:
+                self.log("上一次同步尚未结束，立即同步已跳过")
+            else:
+                self.log("上一次任务尚未结束，5 分钟后重试")
+                self._schedule_auto()
             return
         server = self.server_var.get().strip()
         token = self.token_var.get().strip()
@@ -1653,26 +2005,34 @@ class AgentApp:
             if not selected:
                 self.root.after(0, lambda: self.log("自动同步：当前没有可上传的聊天记录，已跳过"))
                 return
-            groups, singles = split_conversations(selected)
-            self.root.after(0, lambda: self.log(
-                f"自动同步：解析并上传 {len(selected)} 个会话（群聊 {len(groups)}，单聊 {len(singles)}）"
-            ))
+            cursors = _cursor_map(self.settings.get("sync_cursors"))
+            cursors = seed_cursors(
+                server, token, cursors, operator_name,
+                lambda m: self.root.after(0, lambda msg=m: self.log(msg)),
+            )
+            self.settings["sync_cursors"] = cursors
             result = push_sessions(
                 server, token, selected, users,
                 lambda m: self.root.after(0, lambda msg=m: self.log(msg)),
                 operator_name=operator_name,
                 room_nicks=room_nicks,
+                cursors=cursors,
             )
+            self.settings["sync_cursors"] = result.get("cursors") or cursors
             msg = (
-                f"自动同步完成：{result.get('saved_sessions')} 个会话 "
-                f"-> {server}"
+                f"自动同步完成：{result.get('saved_sessions')} 个会话，"
+                f"{result.get('new_messages') or 0} 条新消息 -> {server}"
             )
             self.root.after(0, lambda: self.log(msg))
             self.root.after(0, lambda: self._refresh_after_auto(conversations, users, room_nicks))
         except error.URLError as exc:
-            self.root.after(0, lambda: self.log(f"自动同步失败，无法连接服务器: {exc}"))
+            self.root.after(0, lambda e=exc: self.log(f"自动同步失败，无法连接服务器: {e}"))
         except Exception as exc:
-            self.root.after(0, lambda: self.log(f"自动同步失败: {exc}"))
+            self.root.after(0, lambda e=exc: self.log(f"自动同步失败: {e}"))
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            self.root.after(0, lambda e=exc: self.log(f"自动同步失败: {e}"))
         finally:
             self.root.after(0, self._finish_auto)
 
@@ -1771,8 +2131,12 @@ class AgentApp:
             self.root.after(0, lambda: self.log("解密完成"))
             self.root.after(0, self.reload_conversations)
         except Exception as exc:
-            self.root.after(0, lambda: self.log(f"解密失败: {exc}"))
-            self.root.after(0, lambda: self._notify("解密失败", str(exc), "error"))
+            self.root.after(0, lambda e=exc: self.log(f"解密失败: {e}"))
+            self.root.after(0, lambda e=exc: self._notify("解密失败", str(e), "error"))
+        except BaseException as exc:
+            if isinstance(exc, KeyboardInterrupt):
+                raise
+            self.root.after(0, lambda e=exc: self.log(f"解密失败: {e}"))
         finally:
             self.root.after(0, self._finish_manual)
 
@@ -1809,14 +2173,26 @@ class AgentApp:
 
     def _sync_worker(self, server, token, selected, operator_name=""):
         try:
-            self.root.after(0, lambda: self.log(f"开始同步 {len(selected)} 个会话 -> {server}"))
+            self.root.after(0, lambda: self.log(f"开始增量同步 {len(selected)} 个会话 -> {server}"))
+            cursors = _cursor_map(self.settings.get("sync_cursors"))
+            cursors = seed_cursors(
+                server, token, cursors, operator_name,
+                lambda m: self.root.after(0, lambda msg=m: self.log(msg)),
+            )
+            self.settings["sync_cursors"] = cursors
             result = push_sessions(
                 server, token, selected, self.users,
                 lambda m: self.root.after(0, lambda msg=m: self.log(msg)),
                 operator_name=operator_name,
                 room_nicks=self.room_nicks,
+                cursors=cursors,
             )
-            msg = f"已同步到服务器「{result.get('computer_name')}」，会话 {result.get('saved_sessions')} 个"
+            self.settings["sync_cursors"] = result.get("cursors") or cursors
+            msg = (
+                f"已同步到服务器「{result.get('computer_name')}」，"
+                f"会话 {result.get('saved_sessions')} 个，"
+                f"新消息 {result.get('new_messages') or 0} 条"
+            )
             self.root.after(0, lambda: self.log(msg))
             self.root.after(0, lambda: self._notify("同步完成", msg))
         except error.URLError as exc:

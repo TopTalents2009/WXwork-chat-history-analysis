@@ -65,6 +65,8 @@ export interface Source {
   last_sync: string
   session_count: number
   platform: string
+  agent_version?: string
+  update_available?: boolean
 }
 
 export interface ReadApiInfo {
@@ -75,6 +77,16 @@ export interface ReadApiInfo {
   example?: string
 }
 
+export interface AgentUpdateInfo {
+  version: string
+  sha256?: string
+  size?: number
+  url?: string
+  notes?: string
+  changelog?: { version: string; notes: string[] }[]
+  published?: boolean
+}
+
 export interface IngestInfo {
   token: string
   port: number
@@ -82,6 +94,8 @@ export interface IngestInfo {
   web_port?: number
   web_urls?: string[]
   read_api?: ReadApiInfo
+  agent_update?: AgentUpdateInfo
+  latest_agent_version?: string
 }
 
 export interface PresenceClient {
@@ -91,6 +105,7 @@ export interface PresenceClient {
   host: string
   last_seen: string
   status?: string
+  agent_version?: string
 }
 
 export interface PresenceAlert {
@@ -123,12 +138,49 @@ export interface SearchHit {
   media_url: string
 }
 
+export interface AgentLogInfo {
+  ok?: boolean
+  source_id?: string
+  job_id?: string
+  status: string
+  detail?: string
+  text?: string
+  size?: number
+  filename?: string
+}
+
+export function apiErrorMessage(err: unknown, fallback = '请求失败') {
+  if (axios.isAxiosError(err)) {
+    if (!err.response) return '无法连接接口，请确认分析服务已启动'
+    const detail = (err.response.data as { detail?: string } | undefined)?.detail
+    if (detail) return String(detail)
+  }
+  return fallback
+}
+
 export const chatApi = {
   getPlatforms: () => api.get<Platform[]>('/platforms'),
   getSources: () => api.get<Source[]>('/sources'),
   getIngestInfo: () => api.get<IngestInfo>('/ingest/info'),
   getPresence: (since = 0) =>
     api.get<PresenceSnapshot>('/presence', { params: { since } }),
+  requestAgentLog: (sourceId: string) =>
+    api.post<AgentLogInfo>(`/sources/${encodeURIComponent(sourceId)}/agent-log`),
+  getAgentLog: (sourceId: string, jobId = '') =>
+    api.get<AgentLogInfo>(`/sources/${encodeURIComponent(sourceId)}/agent-log`, {
+      params: jobId ? { job_id: jobId } : undefined,
+      validateStatus: (status) => status < 500,
+    }),
+  agentLogFileUrl: (sourceId: string) =>
+    `/api/sources/${encodeURIComponent(sourceId)}/agent-log/file`,
+  requestSyncNow: (sourceId: string) =>
+    api.post<{ ok: boolean; job_id: string; status: string; detail?: string }>(
+      `/sources/${encodeURIComponent(sourceId)}/sync-now`,
+    ),
+  pushAgentUpdate: (sourceId: string) =>
+    api.post<{ ok: boolean; job_id: string; status: string; version?: string; detail?: string }>(
+      `/sources/${encodeURIComponent(sourceId)}/agent-update`,
+    ),
   searchMessages: (params: {
     q: string
     source_id?: string
